@@ -1,0 +1,18 @@
+# 1. Ignore absolutely everything by default
+*
+
+# 2. Allow Git to look inside folders (recursively) to track structure
+!*/
+
+# 3. DO NOT ignore code files anywhere (root or subfolders)
+!*.R
+!*.Rmd
+!*.qmd
+!*.py
+!.gitignore
+
+# 4. DO NOT ignore your specific R project configurations
+!.Rproj.user/
+!.Rhistory
+!.RData
+!.Ruserdata

@@ -1,0 +1,1800 @@
+---
+title: "UTCI and Mortality in West African INDEPTH HDSS Sites: Gold-Standard DLNM Case-Crossover Analysis"
+author: "Asanba"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(haven)
+library(hrbrthemes)
+library(gtsummary)
+library(flextable)
+library(visdat)
+library(naniar)
+library(dlnm)
+library(splines)
+library(gnm)       # conditional quasi-Poisson (replaces bare clogit for inference)
+library(survival)  # kept only as an optional cross-check against gnm
+```
+
+```{r config}
+# --- CONFIG: edit these paths once ---
+PATH_ROOT       <- "D:/yaku-alex/west_Africa"
+PATH_UTCI       <- file.path(PATH_ROOT, "Data/UTCI_daily_sites_2009_2016.csv")
+PATH_HEALTH_DTA <- file.path(PATH_ROOT, "Data/ConsolidatedData2018_analysis.dta")
+MAX_LAG         <- 28   # days; revisit vs. literature (many mortality DLNMs use 21d for slow-onset causes)
+
+setwd(PATH_ROOT)
+```
+
+
+
+```{r}
+raw_data <- read_dta(PATH_HEALTH_DTA) %>%rename_all(str_to_lower)
+```
+
+# 1. Load and clean INDEPTH mortality microdata
+
+```{r load-health}
+
+
+wa_prefixes <- c("BF", "CI", "GH", "GM", "NG", "SN")
+
+west_africa_mortality <- raw_data %>%
+  filter(str_sub(centreid, 1, 2) %in% wa_prefixes) %>%
+  filter(eventcode == 7) %>%   # confirmed deaths
+  filter(residence == 1)       # resident at site on day of death
+
+processed_cases <- west_africa_mortality %>%
+  mutate(
+    eventdate = as.Date(eventdate),
+    dob       = as.Date(dob),
+    age_at_death = as.numeric(difftime(eventdate, dob, units = "days")) / 365.25,
+    year  = year(eventdate),
+    month = month(eventdate),
+    dow   = wday(eventdate, label = TRUE, abbr = FALSE),
+    stratum_id = row_number()
+  ) %>%
+  select(countryid, stratum_id, concat_individualid, centreid, locationid,
+         sex, age_at_death, eventdate, year, month, dow) %>%
+  mutate(
+    age_group = case_when(
+      age_at_death <= 5                          ~ "Young Children (<=5)",
+      age_at_death > 5  & age_at_death <= 18      ~ "School-age (5-18)",
+      age_at_death > 18 & age_at_death <= 65       ~ "Working-age (18-65)",
+      age_at_death > 65                            ~ "Elderly (>65)",
+      TRUE ~ "Unknown"
+    ),
+    age_group = factor(age_group, levels = c(
+      "Young Children (<=5)", "School-age (5-18)",
+      "Working-age (18-65)", "Elderly (>65)"
+    )),
+    country_name = case_when(
+      countryid == 854 ~ "Burkina Faso",
+      countryid == 288 ~ "Ghana",
+      countryid == 384 ~ "Côte d'Ivoire",
+      countryid == 270 ~ "The Gambia",
+      countryid == 566 ~ "Nigeria",
+      countryid == 686 ~ "Senegal",
+      TRUE ~ "Unknown"
+    ),
+    # Correction: Nanoro (BF021) is mis-tabulated under Ethiopia's countryid
+    # in this extract; centreid prefix is the reliable source of truth.
+    country_name = if_else(str_sub(centreid, 1, 2) == "BF", "Burkina Faso", country_name)
+  )
+
+processed_cases %>% count(country_name, countryid)
+```
+
+# 2. Time-stratified case-crossover matrix (Bateson & Schwartz design)
+
+Referents are all other days in the same calendar month falling on the same
+day of week as the death -- this design inherently controls for long-term
+trend, season, and day-of-week without needing separate spline terms for
+those factors.
+
+```{r case-crossover}
+get_referent_days <- function(case_date) {
+  m_start <- floor_date(case_date, "month")
+  m_end   <- ceiling_date(case_date, "month") - days(1)
+  month_days <- seq(m_start, m_end, by = "1 day")
+  month_days[wday(month_days) == wday(case_date) & month_days != case_date]
+}
+
+cc_matrix <- processed_cases %>%
+  group_by(stratum_id) %>%
+  do({
+    case_row <- .
+    control_dates <- get_referent_days(case_row$eventdate)
+    control_rows <- map_df(control_dates, ~ case_row %>% mutate(eventdate = .x, outcome = 0))
+    case_row <- case_row %>% mutate(outcome = 1)
+    bind_rows(case_row, control_rows)
+  }) %>%
+  ungroup()
+
+final_health_data <- cc_matrix %>%
+  rename(date = eventdate) %>%
+  mutate(time_in_study = as.numeric(date) - min(as.numeric(date))) %>%
+  arrange(stratum_id, date) %>%
+  filter(year >= 2009 & year <= 2016) %>%
+  mutate(
+    is_tier1 = if_else(year >= 2011 & year <= 2014, 1, 0),
+    is_tier2 = if_else(year >= 2009 & year <= 2015 &
+                          str_sub(centreid, 1, 2) %in% c("GM", "CI", "SN", "BF"), 1, 0)
+  )
+
+write_csv(final_health_data, "final_health.csv")
+```
+
+# 3. Load and process UTCI climate data, build lag matrix
+```{r}
+UTCI_daily <- read_csv(PATH_UTCI)
+names(UTCI_daily)
+```
+
+
+```{r climate}
+UTCI_daily <- UTCI_daily %>%
+  mutate(
+    date = as.Date(date),
+    across(c(utci_min, utci_mean, utci_max), ~ . - 273.15)
+  ) %>%
+  rename(centreid = site_id) %>%
+  arrange(centreid, date) %>%
+  group_by(centreid) %>%
+  mutate(
+    utci_lag0 = utci_mean
+  )
+
+for(i in 1:MAX_LAG){
+
+    UTCI_daily <-
+        UTCI_daily %>%
+        mutate(
+            !!paste0("utci_lag",i) :=
+                lag(utci_mean,i)
+        )
+
+}
+
+UTCI_daily <- UTCI_daily %>%
+    ungroup()
+```
+
+```{r climate-trend-plots, fig.width=10, fig.height=6}
+for (current_site in unique(UTCI_daily$centreid)) {
+  site_data <- UTCI_daily %>%
+    filter(centreid == current_site) %>%
+    pivot_longer(cols = c(utci_min, utci_mean, utci_max),
+                 names_to = "index_type", values_to = "utci_value") %>%
+    mutate(index_type = recode(index_type,
+      utci_max = "Maximum UTCI", utci_mean = "Mean UTCI", utci_min = "Minimum UTCI"))
+
+  p <- ggplot(site_data, aes(date, utci_value, color = index_type)) +
+    geom_line(alpha = 0.2, linewidth = 0.4) +
+    geom_smooth(method = "gam", se = FALSE, linewidth = 1.3) +
+    scale_color_manual(values = c("Maximum UTCI" = "#d95f02",
+                                   "Mean UTCI" = "#7570b3",
+                                   "Minimum UTCI" = "#1b9e77")) +
+    scale_x_date(date_labels = "%Y", date_breaks = "2 years") +
+    labs(title = paste("UTCI Trends:", current_site),
+         x = "Year", y = "UTCI (\u00b0C)", color = "Metric") +
+    theme_ipsum(grid = "XY") + theme(legend.position = "top")
+  print(p)
+}
+```
+
+# 4. Merge exposure onto the case-crossover matrix
+
+```{r merge}
+analysis_ready_matrix <- final_health_data %>%
+  left_join(UTCI_daily, by = c("centreid", "date"))
+
+stopifnot(nrow(analysis_ready_matrix) == nrow(final_health_data))
+n_missing_exposure <- sum(is.na(analysis_ready_matrix$utci_mean))
+message(n_missing_exposure, " rows failed to match a UTCI grid cell (dropped below).")
+
+analysis_ready_matrix <-analysis_ready_matrix %>%filter(
+  !is.na(
+    .data[[paste0("utci_lag",MAX_LAG)]]))
+```
+
+```{r}
+write.csv(analysis_ready_matrix,"mortality_health_analysis_readydata.csv")
+```
+
+
+```{r}
+# Save your dataset as a compressed R data file (.rds)
+saveRDS(analysis_ready_matrix, "mortality_health_analysis_readydata.rds")
+
+
+```
+
+######### new
+```{r}
+lag_matrix <-
+as.matrix(
+    analysis_ready_matrix[
+        ,
+        paste0("utci_lag",0:MAX_LAG)
+    ]
+)
+
+cb <- crossbasis(
+    lag_matrix,
+    lag=MAX_LAG,
+    argvar=list(
+        fun="ns",
+        knots=var_knots
+    ),
+    arglag=list(
+        fun="ns",
+        knots=lag_knots
+    )
+)
+```
+
+```{r}
+sum(is.na(cb))
+# 0
+
+qr(cb)$rank
+# equals ncol(cb)
+
+kappa(cb)
+# substantially lower than before
+```
+
+
+
+
+```{r}
+##########################################################
+# Basis correlation
+##########################################################
+
+R <- cor(cb)
+
+round(R, 2)
+```
+
+
+```{r}
+library(corrplot)
+
+corrplot(
+  R,
+  method = "color",
+  type = "upper",
+  tl.cex = .6
+)
+```
+
+#Step 1. Fit the model
+```{r}
+fit_primary <- gnm(
+  outcome ~ cb,
+  eliminate = factor(stratum_id),
+  family = quasipoisson(),
+  data = analysis_ready_matrix
+)
+#Step 2. Convergence
+fit_primary$converged
+
+```
+
+<!-- Expected: -->
+
+<!-- TRUE -->
+#Step 3. Overdispersion
+
+```{r}
+phi <- deviance(fit_primary) / df.residual(fit_primary)
+
+phi
+```
+
+#Step 4. Coefficient sanity
+```{r}
+summary(fit_primary)
+```
+
+
+
+#Step 5. Cross-prediction
+```{r}
+pred <- crosspred(
+  cb,
+  fit_primary,
+  by = 0.1,
+  model.link = "log"
+)
+```
+
+
+
+```{r}
+
+pred0 <-
+crosspred(
+    cb,
+    fit_primary,
+    by=.1
+)
+
+MMT <-
+pred0$predvar[
+which.min(pred0$allRRfit)
+]
+
+MMT
+```
+
+```{r}
+
+plot(
+    pred0,
+    "overall",
+    xlab="UTCI",
+    ylab="RR"
+)
+```
+
+
+
+```{r}
+
+############################################################
+# GOLD-STANDARD DLNM SPECIFICATION
+############################################################
+
+library(dlnm)
+
+MAX_LAG <- 28
+
+## Exposure knots
+var_knots <- equalknots(
+    analysis_ready_matrix$utci_mean,
+    fun = "ns",
+    df = 3
+)
+
+## Lag knots
+lag_knots <- logknots(
+    MAX_LAG,
+    nk = 3
+)
+
+lag_matrix <-
+    as.matrix(
+        analysis_ready_matrix[
+            ,
+            paste0("utci_lag",0:MAX_LAG)
+        ]
+    )
+
+cb <-
+crossbasis(
+    lag_matrix,
+    lag = MAX_LAG,
+    argvar = list(
+        fun = "ns",
+        knots = var_knots
+    ),
+    arglag = list(
+        fun = "ns",
+        knots = lag_knots
+    )
+)
+```
+
+
+
+
+```{r}
+############################################################
+# CROSSBASIS DIAGNOSTICS
+############################################################
+
+cat("Dimensions\n")
+dim(cb)
+
+cat("Rank\n")
+qr(cb)$rank
+
+cat("Columns\n")
+ncol(cb)
+
+cat("Condition number\n")
+kappa(cb)
+
+cat("Missing values\n")
+sum(is.na(cb))
+```
+
+
+```{r}
+############################################################
+# EXPOSURE DISTRIBUTION
+############################################################
+
+summary(
+    analysis_ready_matrix$utci_mean
+)
+
+quantile(
+    analysis_ready_matrix$utci_mean,
+    probs=c(
+        .01,.05,.10,.25,.50,.75,.90,.95,.99
+    )
+)
+
+hist(
+    analysis_ready_matrix$utci_mean,
+    breaks=40,
+    col="grey80",
+    main="Observed UTCI",
+    xlab="UTCI"
+)
+```
+
+
+```{r}
+############################################################
+# LAG CORRELATION
+############################################################
+
+lag_cor <-
+cor(
+analysis_ready_matrix[
+,
+paste0("utci_lag",0:MAX_LAG)
+])
+
+round(lag_cor,2)
+
+image(lag_cor)
+```
+```{r}
+############################################################
+# PRIMARY MODEL
+############################################################
+
+fit_primary <-
+gnm(
+outcome~cb,
+eliminate=factor(stratum_id),
+family=quasipoisson(),
+data=analysis_ready_matrix
+)
+
+fit_primary$converged
+```
+
+
+
+```{r}
+phi <-
+deviance(fit_primary)/
+df.residual(fit_primary)
+
+phi
+```
+
+
+
+
+```{r}
+res <-
+residuals(
+fit_primary,
+type="deviance"
+)
+
+hist(
+res,
+breaks=40,
+main="Residuals"
+)
+
+qqnorm(res)
+
+qqline(res)
+```
+
+
+
+```{r}
+plot(
+fitted(fit_primary),
+res,
+pch=16,
+cex=.5
+)
+
+abline(h=0,lty=2)
+```
+
+
+```{r}
+############################################################
+# PREDICTION
+############################################################
+
+pred0 <-
+crosspred(
+cb,
+fit_primary,
+by=.1,
+model.link="log"
+)
+```
+
+
+
+```{r}
+############################################################
+# MMT
+############################################################
+
+# q <-
+# quantile(
+# analysis_ready_matrix$utci_mean,
+# c(.05,.95)
+# )
+# 
+# id <-
+# pred0$predvar>=q[1] &
+# pred0$predvar<=q[2]
+# 
+# MMT <-
+# pred0$predvar[id][which.min(pred0$allRRfit[id])]
+# 
+# MMT
+search_range <-pred$predvar >= quantile(analysis_ready_matrix$utci_mean,0.05) & pred$predvar <= quantile(analysis_ready_matrix$utci_mean,0.95)
+
+MMT <-pred$predvar[search_range][which.min(pred$allRRfit[search_range])]
+MMT
+
+```
+
+
+
+```{r}
+plot(
+pred0,
+"overall",
+ci="area",
+xlab="UTCI",
+ylab="Relative Risk",
+lwd=2
+)
+
+abline(
+v=MMT,
+col=2,
+lwd=2,
+lty=2
+)
+```
+
+
+```{r}
+plot(
+pred0,
+theta=220,
+phi=40,
+ltheta=170,
+shade=.4,
+col="lightblue"
+)
+```
+
+
+
+
+```{r}
+
+dfs <- c(3,4,5)
+
+results <- list()
+
+for(d in dfs){
+
+vk <- equalknots(
+analysis_ready_matrix$utci_mean,
+fun="ns",
+df=d
+)
+
+cb_tmp <-
+crossbasis(
+lag_matrix,
+lag=MAX_LAG,
+argvar=list(
+fun="ns",
+knots=vk
+),
+arglag=list(
+fun="ns",
+knots=lag_knots
+)
+)
+
+fit_tmp <-
+gnm(
+outcome~cb_tmp,
+eliminate=factor(stratum_id),
+family=quasipoisson(),
+data=analysis_ready_matrix
+)
+
+results[[paste0("df",d)]] <-
+crosspred(
+cb_tmp,
+fit_tmp,
+by=.1
+)
+
+}
+```
+
+
+
+```{r}
+lags <- c(2,3,4)
+
+for(k in lags){
+
+lk <-
+logknots(
+MAX_LAG,
+nk=k
+)
+
+## fit model exactly as above
+
+}
+```
+
+Lag window
+windows <- c(14,21,28)
+
+Fit otherwise identical models with each lag window and compare the cumulative RR curves and MMT estimates.
+
+
+########## querying the mmt
+
+```{r}
+
+summary(analysis_ready_matrix$utci_mean)
+
+quantile(
+  analysis_ready_matrix$utci_mean,
+  probs = c(0.01,0.05,0.10,0.25,0.50,0.75,0.90,0.95,0.99),
+  na.rm = TRUE
+)
+
+```
+
+
+
+
+
+
+```{r}
+library(dlnm)
+library(gnm)
+library(corrplot)
+
+library(dlnm)
+library(gnm)
+library(dplyr)
+
+compare_lag_windows <- function(
+    data,
+    outcome_var = "outcome",
+    exposure_var = "utci_mean",
+    stratum_var = "stratum_id",
+    lag_prefix = "utci_lag",
+    lag_windows = c(3,7,14,21,28),
+    exposure_df = 3,
+    prediction_by = 0.1
+){
+
+  ##########################################################
+  # Exposure basis fixed across all models
+  ##########################################################
+
+  var_knots <- equalknots(
+    data[[exposure_var]],
+    fun = "ns",
+    df = exposure_df
+  )
+
+  ##########################################################
+  # Helper for lag basis
+  ##########################################################
+
+  get_lag_basis <- function(max_lag){
+
+    if(max_lag <= 3){
+
+      list(fun = "integer")
+
+    } else if(max_lag <= 7){
+
+      list(fun = "ns", df = 2)
+
+    } else if(max_lag <= 14){
+
+      list(fun = "ns", df = 3)
+
+    } else {
+
+      list(
+        fun = "ns",
+        knots = logknots(max_lag, nk = 3)
+      )
+
+    }
+
+  }
+
+  ##########################################################
+  # Storage
+  ##########################################################
+
+  results <- list()
+
+  ##########################################################
+  # Loop through lag windows
+  ##########################################################
+
+  for(max_lag in lag_windows){
+
+    cat("\n")
+    cat("====================================\n")
+    cat("Fitting lag window:", max_lag, "\n")
+    cat("====================================\n")
+
+    lag_cols <- paste0(
+      lag_prefix,
+      0:max_lag
+    )
+
+    ########################################################
+    # Check lag variables exist
+    ########################################################
+
+    missing_cols <- setdiff(
+      lag_cols,
+      names(data)
+    )
+
+    if(length(missing_cols) > 0){
+
+      warning(
+        paste(
+          "Missing columns:",
+          paste(missing_cols, collapse = ", ")
+        )
+      )
+
+      next
+
+    }
+
+    ########################################################
+    # Build lag matrix
+    ########################################################
+
+    lag_matrix <- as.matrix(
+      data[, lag_cols]
+    )
+
+    ########################################################
+    # Complete cases
+    ########################################################
+
+    keep <- complete.cases(lag_matrix)
+
+    analysis_data <- data[keep, ]
+
+    lag_matrix <- lag_matrix[keep, ]
+
+    cat(
+      "Rows retained:",
+      nrow(analysis_data),
+      "\n"
+    )
+
+    ########################################################
+    # Crossbasis
+    ########################################################
+
+    cb <- crossbasis(
+      lag_matrix,
+      lag = max_lag,
+      argvar = list(
+        fun = "ns",
+        knots = var_knots
+      ),
+      arglag = get_lag_basis(max_lag)
+    )
+
+    ########################################################
+    # Diagnostics
+    ########################################################
+
+    rank_cb <- qr(cb)$rank
+
+    n_basis <- ncol(cb)
+
+    kappa_val <- tryCatch(
+      kappa(cb),
+      error = function(e) NA
+    )
+
+    max_cor <- tryCatch({
+
+      R <- cor(cb)
+
+      max(
+        abs(R[upper.tri(R)]),
+        na.rm = TRUE
+      )
+
+    },
+    error = function(e) NA)
+
+    ########################################################
+    # Fit model
+    ########################################################
+
+    formula_fit <- as.formula(
+      paste0(
+        outcome_var,
+        " ~ cb"
+      )
+    )
+
+    fit <- tryCatch(
+
+      gnm(
+        formula_fit,
+        eliminate = factor(
+          analysis_data[[stratum_var]]
+        ),
+        family = quasipoisson(),
+        data = analysis_data
+      ),
+
+      error = function(e){
+
+        message(
+          "Model failed at lag ",
+          max_lag
+        )
+
+        return(NULL)
+
+      }
+
+    )
+
+    if(is.null(fit)) next
+
+    ########################################################
+    # Overdispersion
+    ########################################################
+
+    phi <- tryCatch(
+      deviance(fit) /
+        df.residual(fit),
+      error = function(e) NA
+    )
+
+    ########################################################
+    # Prediction
+    ########################################################
+
+    pred <- tryCatch(
+
+      crosspred(
+        cb,
+        fit,
+        by = prediction_by,
+        model.link = "log"
+      ),
+
+      error = function(e){
+
+        message(
+          "crosspred failed at lag ",
+          max_lag
+        )
+
+        return(NULL)
+
+      }
+
+    )
+
+    ########################################################
+    # MMT
+    ########################################################
+
+    MMT <- NA
+
+    if(!is.null(pred)){
+
+      q <- quantile(
+        analysis_data[[exposure_var]],
+        probs = c(.01,.99),
+        na.rm = TRUE
+      )
+
+      idx <- pred$predvar >= q[1] &
+        pred$predvar <= q[2]
+
+      if(any(idx)){
+
+        MMT <- pred$predvar[idx][
+          which.min(
+            pred$allRRfit[idx]
+          )
+        ]
+
+      }
+
+    }
+
+    ########################################################
+    # QAIC
+    ########################################################
+
+    p <- length(coef(fit))
+
+    QAIC <- tryCatch(
+
+      deviance(fit) +
+        2 * p * phi,
+
+      error = function(e) NA
+
+    )
+
+    ########################################################
+    # Store
+    ########################################################
+
+    results[[paste0("lag_", max_lag)]] <- list(
+
+      lag_window = max_lag,
+
+      fit = fit,
+
+      pred = pred,
+
+      crossbasis = cb,
+
+      converged = fit$converged,
+
+      phi = phi,
+
+      QAIC = QAIC,
+
+      MMT = MMT,
+
+      rank = rank_cb,
+
+      n_basis = n_basis,
+
+      kappa = kappa_val,
+
+      max_correlation = max_cor
+
+    )
+
+  }
+
+  ##########################################################
+  # Summary table
+  ##########################################################
+
+  summary_table <- bind_rows(
+
+    lapply(
+      results,
+      function(x){
+
+        data.frame(
+
+          lag_window = x$lag_window,
+
+          converged = x$converged,
+
+          QAIC = round(x$QAIC,2),
+
+          phi = round(x$phi,2),
+
+          MMT = round(x$MMT,2),
+
+          rank = x$rank,
+
+          n_basis = x$n_basis,
+
+          kappa = round(x$kappa,2),
+
+          max_correlation = round(
+            x$max_correlation,
+            3
+          )
+
+        )
+
+      }
+
+    )
+
+  )
+
+  if(nrow(summary_table) > 0){
+
+    summary_table <-
+      summary_table %>%
+      arrange(QAIC)
+
+  }
+
+  return(
+
+    list(
+
+      summary = summary_table,
+
+      models = results
+
+    )
+
+  )
+
+}
+```
+
+
+```{r}
+lag_compare <- compare_lag_windows(
+  data = analysis_ready_matrix,
+  outcome_var = "outcome",
+  exposure_var = "utci_mean",
+  stratum_var = "stratum_id",
+  lag_prefix = "utci_lag",
+  lag_windows = c(3,7,14,21,28)
+)
+
+lag_compare$summary
+```
+```{r}
+plot_lag_comparison <- function(
+    lag_compare,
+    exposure_var = "UTCI"
+){
+
+    ####################################################
+    # Extract successful predictions
+    ####################################################
+
+    valid_models <- lag_compare$models[
+        sapply(
+            lag_compare$models,
+            function(x) !is.null(x$pred)
+        )
+    ]
+
+    if(length(valid_models) == 0){
+
+        stop("No valid predictions found.")
+
+    }
+
+    ####################################################
+    # Dynamic axis limits
+    ####################################################
+
+    x_range <- range(
+        unlist(
+            lapply(
+                valid_models,
+                function(x) x$pred$predvar
+            )
+        ),
+        na.rm = TRUE
+    )
+
+    y_range <- range(
+        unlist(
+            lapply(
+                valid_models,
+                function(x) x$pred$allRRfit
+            )
+        ),
+        na.rm = TRUE
+    )
+
+    ####################################################
+    # Colors
+    ####################################################
+
+    cols <- c(
+        "#1B9E77",
+        "#D95F02",
+        "#7570B3",
+        "#E7298A",
+        "#66A61E",
+        "#E6AB02",
+        "#A6761D"
+    )
+
+    ####################################################
+    # Empty plot
+    ####################################################
+
+    plot(
+        NULL,
+        xlim = x_range,
+        ylim = y_range,
+        xlab = exposure_var,
+        ylab = "Cumulative Relative Risk",
+        main = "DLNM Lag Window Comparison"
+    )
+
+    ####################################################
+    # Add curves
+    ####################################################
+
+    i <- 1
+
+    legend_text <- c()
+
+    for(model_name in names(valid_models)){
+
+        pred <- valid_models[[model_name]]$pred
+
+        lag_window <- valid_models[[model_name]]$lag_window
+
+        MMT <- round(
+            valid_models[[model_name]]$MMT,
+            1
+        )
+
+        lines(
+            pred$predvar,
+            pred$allRRfit,
+            col = cols[i],
+            lwd = 2
+        )
+
+        abline(
+            v = MMT,
+            col = cols[i],
+            lty = 2
+        )
+
+        legend_text <- c(
+            legend_text,
+            paste0(
+                lag_window,
+                " d (MMT=",
+                MMT,
+                ")"
+            )
+        )
+
+        i <- i + 1
+
+    }
+
+    ####################################################
+    # RR=1 reference
+    ####################################################
+
+    abline(
+        h = 1,
+        lty = 2,
+        col = "grey40"
+    )
+
+    ####################################################
+    # Legend
+    ####################################################
+
+    legend(
+        "topright",
+        legend = legend_text,
+        col = cols[seq_along(legend_text)],
+        lwd = 2,
+        bty = "n",
+        cex = 0.9
+    )
+
+}
+```
+
+
+
+```{r}
+plot_lag_comparison(
+    lag_compare,
+    exposure_var = "UTCI (°C)"
+)
+```
+
+
+
+```{r}
+
+library(dlnm)
+library(gnm)
+library(dplyr)
+
+dlnm_sensitivity <- function(
+    data,
+    max_lag = 21,
+    exposure_var = "utci_mean",
+    outcome_var = "outcome",
+    stratum_var = "stratum_id",
+    lag_prefix = "utci_lag",
+    exposure_dfs = c(3,4,5),
+    lag_dfs = c(2,3,4,5),
+    by = 0.1
+){
+
+    lag_cols <- paste0(
+        lag_prefix,
+        0:max_lag
+    )
+
+    lag_matrix <- as.matrix(
+        data[, lag_cols]
+    )
+
+    keep <- complete.cases(lag_matrix)
+
+    lag_matrix <- lag_matrix[keep, ]
+
+    analysis_data <- data[keep, ]
+
+    results <- list()
+
+    counter <- 1
+
+    for(vdf in exposure_dfs){
+
+        for(ldf in lag_dfs){
+
+            cat(
+                "\n",
+                "Exposure df =", vdf,
+                "| Lag df =", ldf,
+                "\n"
+            )
+
+            ##################################################
+            # Exposure basis
+            ##################################################
+
+            var_knots <- equalknots(
+                analysis_data[[exposure_var]],
+                fun = "ns",
+                df = vdf
+            )
+
+            ##################################################
+            # Lag basis
+            ##################################################
+
+            lag_knots <- logknots(
+                max_lag,
+                nk = ldf
+            )
+
+            ##################################################
+            # Crossbasis
+            ##################################################
+
+            cb <- crossbasis(
+                lag_matrix,
+                lag = max_lag,
+                argvar = list(
+                    fun = "ns",
+                    knots = var_knots
+                ),
+                arglag = list(
+                    fun = "ns",
+                    knots = lag_knots
+                )
+            )
+
+            ##################################################
+            # Fit model
+            ##################################################
+
+            fit <- tryCatch(
+
+                gnm(
+                    as.formula(
+                        paste0(
+                            outcome_var,
+                            "~ cb"
+                        )
+                    ),
+                    eliminate =
+                        factor(
+                            analysis_data[[stratum_var]]
+                        ),
+                    family = quasipoisson(),
+                    data = analysis_data
+                ),
+
+                error = function(e) NULL
+            )
+
+            if(is.null(fit))
+                next
+
+            ##################################################
+            # Prediction
+            ##################################################
+
+            pred <- tryCatch(
+
+                crosspred(
+                    cb,
+                    fit,
+                    by = by,
+                    model.link = "log"
+                ),
+
+                error = function(e) NULL
+            )
+
+            ##################################################
+            # MMT
+            ##################################################
+
+            MMT <- NA
+
+            if(!is.null(pred)){
+
+                q <- quantile(
+                    analysis_data[[exposure_var]],
+                    c(.01,.99),
+                    na.rm = TRUE
+                )
+
+                idx <- pred$predvar >= q[1] &
+                    pred$predvar <= q[2]
+
+                MMT <- pred$predvar[idx][
+                    which.min(
+                        pred$allRRfit[idx]
+                    )
+                ]
+
+            }
+
+            ##################################################
+            # QAIC
+            ##################################################
+
+            phi <- deviance(fit) /
+                df.residual(fit)
+
+            p <- length(coef(fit))
+
+            QAIC <- deviance(fit) +
+                2 * p * phi
+
+            ##################################################
+            # Collinearity
+            ##################################################
+
+            kappa_val <- tryCatch(
+                kappa(cb),
+                error=function(e) NA
+            )
+
+            ##################################################
+            # Save
+            ##################################################
+
+            results[[counter]] <- data.frame(
+
+                exposure_df = vdf,
+
+                lag_df = ldf,
+
+                QAIC = QAIC,
+
+                phi = phi,
+
+                MMT = MMT,
+
+                kappa = kappa_val,
+
+                converged =
+                    fit$converged
+
+            )
+
+            counter <- counter + 1
+
+        }
+
+    }
+
+    bind_rows(results) %>%
+        arrange(QAIC)
+
+}
+```
+
+
+
+```{r}
+spec_results <- dlnm_sensitivity(
+    data = analysis_ready_matrix,
+    max_lag = 21,
+    exposure_dfs = c(3,4,5),
+    lag_dfs = c(2,3,4,5)
+)
+
+spec_results
+```
+
+
+
+```{r}
+library(ggplot2)
+
+ggplot(
+    spec_results,
+    aes(
+        factor(exposure_df),
+        factor(lag_df),
+        fill = QAIC
+    )
+) +
+    geom_tile() +
+    geom_text(
+        aes(
+            label = round(QAIC,0)
+        ),
+        size = 3
+    ) +
+    labs(
+        x = "Exposure df",
+        y = "Lag df",
+        fill = "QAIC"
+    ) +
+    theme_bw()
+```
+
+
+## 1. Sensitivity of the Exposure–Response Curve to Spline Complexity
+
+## You already fitted the models. Now visually compare the best candidates:
+
+```{r}
+best_specs <- list(
+
+  "df5_lag5" = list(vdf = 5, ldf = 5),
+  "df5_lag4" = list(vdf = 5, ldf = 4),
+  "df5_lag3" = list(vdf = 5, ldf = 3),
+  "df4_lag5" = list(vdf = 4, ldf = 5)
+
+)
+
+plot(
+  NULL,
+  xlim = range(analysis_ready_matrix$utci_mean, na.rm = TRUE),
+  ylim = c(0.8, 2),
+  xlab = "UTCI (°C)",
+  ylab = "Cumulative RR",
+  main = "Sensitivity to Spline Specification"
+)
+
+cols <- c(
+  "red",
+  "blue",
+  "darkgreen",
+  "purple"
+)
+
+i <- 1
+
+for(spec in names(best_specs)){
+
+  vdf <- best_specs[[spec]]$vdf
+  ldf <- best_specs[[spec]]$ldf
+
+  var_knots <- equalknots(
+    analysis_ready_matrix$utci_mean,
+    fun = "ns",
+    df = vdf
+  )
+
+  lag_knots <- logknots(
+    21,
+    nk = ldf
+  )
+
+  lag_matrix <- as.matrix(
+    analysis_ready_matrix[
+      ,
+      paste0("utci_lag",0:21)
+    ]
+  )
+
+  keep <- complete.cases(lag_matrix)
+
+  lag_matrix2 <- lag_matrix[keep,]
+
+  dat <- analysis_ready_matrix[keep,]
+
+  cb <- crossbasis(
+    lag_matrix2,
+    lag = 21,
+    argvar = list(
+      fun = "ns",
+      knots = var_knots
+    ),
+    arglag = list(
+      fun = "ns",
+      knots = lag_knots
+    )
+  )
+
+  fit <- gnm(
+    outcome ~ cb,
+    eliminate = factor(stratum_id),
+    family = quasipoisson(),
+    data = dat
+  )
+
+  pred <- crosspred(
+    cb,
+    fit,
+    by = 0.1
+  )
+
+  lines(
+    pred$predvar,
+    pred$allRRfit,
+    col = cols[i],
+    lwd = 2
+  )
+
+  i <- i + 1
+}
+
+abline(h = 1, lty = 2)
+
+legend(
+  "topright",
+  legend = names(best_specs),
+  col = cols,
+  lwd = 2,
+  bty = "n"
+)
+
+```
+
+
+
+## 2. MMT Stability Analysis
+
+## This is one of the most important checks.
+
+##Reviewers often ask:
+
+## "How stable is the MMT estimate across model specifications?"
+
+```{r}
+mmt_sensitivity <- function(
+    data,
+    lag_window = 21,
+    exposure_dfs = c(3,4,5),
+    lag_dfs = c(2,3,4,5)
+){
+
+  lag_matrix <- as.matrix(
+    data[
+      ,
+      paste0("utci_lag",0:lag_window)
+    ]
+  )
+
+  keep <- complete.cases(lag_matrix)
+
+  lag_matrix <- lag_matrix[keep,]
+
+  dat <- data[keep,]
+
+  out <- list()
+
+  k <- 1
+
+  for(vdf in exposure_dfs){
+
+    for(ldf in lag_dfs){
+
+      var_knots <- equalknots(
+        dat$utci_mean,
+        fun = "ns",
+        df = vdf
+      )
+
+      lag_knots <- logknots(
+        lag_window,
+        nk = ldf
+      )
+
+      cb <- crossbasis(
+        lag_matrix,
+        lag = lag_window,
+        argvar = list(
+          fun = "ns",
+          knots = var_knots
+        ),
+        arglag = list(
+          fun = "ns",
+          knots = lag_knots
+        )
+      )
+
+      fit <- gnm(
+        outcome ~ cb,
+        eliminate = factor(stratum_id),
+        family = quasipoisson(),
+        data = dat
+      )
+
+      pred <- crosspred(
+        cb,
+        fit,
+        by = 0.1
+      )
+
+      q <- quantile(
+        dat$utci_mean,
+        c(.01,.99)
+      )
+
+      idx <-
+        pred$predvar >= q[1] &
+        pred$predvar <= q[2]
+
+      MMT <-
+        pred$predvar[idx][
+          which.min(
+            pred$allRRfit[idx]
+          )
+        ]
+
+      out[[k]] <- data.frame(
+        exposure_df = vdf,
+        lag_df = ldf,
+        MMT = MMT
+      )
+
+      k <- k + 1
+
+    }
+
+  }
+
+  bind_rows(out)
+
+}
+
+```
+
+
+
+```{r}
+mmt_results <- mmt_sensitivity(
+  analysis_ready_matrix,
+  lag_window = 21
+)
+mmt_results
+
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(
+  mmt_results,
+  aes(
+    factor(exposure_df),
+    factor(lag_df),
+    fill = MMT
+  )
+) +
+  geom_tile() +
+  geom_text(
+    aes(
+      label = round(MMT,1)
+    ),
+    size = 4
+  ) +
+  labs(
+    x = "Exposure df",
+    y = "Lag df",
+    fill = "MMT (°C)"
+  ) +
+  theme_bw()
+```
+
+## Relative Risk Stability at Extreme Temperatures
+
+<!-- This is often more informative than MMT alone. -->
+
+<!-- For example: -->
+
+<!-- Cold effect -->
+<!-- 1st percentile vs MMT -->
+<!-- Heat effect -->
+<!-- 99th percentile vs MMT -->
+
+<!-- Create a table of: -->
+
+<!-- Exposure df	Lag df	RR Cold	RR Heat -->
+
+<!-- and verify whether the estimated risks remain stable across specifications. -->
+
+```{r}
+# Extract RR at the 1st and 99th percentile
+# 
+# For your preferred model:
+
+q <- quantile(
+  analysis_ready_matrix$utci_mean,
+  c(.01,.99)
+)
+
+pred_final <- crosspred(
+  cb,
+  fit,
+  cen = MMT,
+  by = 0.1
+)
+
+cold_rr <- pred_final$allRRfit[
+  which.min(
+    abs(pred_final$predvar - q[1])
+  )
+]
+
+heat_rr <- pred_final$allRRfit[
+  which.min(
+    abs(pred_final$predvar - q[2])
+  )
+]
+
+cold_rr
+heat_rr
+```
+

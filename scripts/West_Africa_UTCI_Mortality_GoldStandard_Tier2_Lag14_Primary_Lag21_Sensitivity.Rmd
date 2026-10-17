@@ -1,0 +1,2135 @@
+---
+title: "West Africa UTCI-Mortality: Gold-Standard DLNM / MCC-Style Pipeline"
+subtitle: "Tier 2 primary analysis (data-driven temporal coverage); Lag 14 primary, Lag 21 sensitivity"
+author: "Asanba"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+    fig_caption: true
+    number_sections: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, results="asis", fig.align="center", out.width="6.25in", fig.retina=200, fig.pos="H")
+library(tidyverse); library(lubridate); library(dlnm); library(gnm); library(splines)
+library(mixmeta); library(gtsummary); library(flextable); library(officer); library(patchwork); library(scales); library(corrplot)
+flumodl_ok <- requireNamespace("FluMoDL", quietly=TRUE)
+if (!flumodl_ok) warning("FluMoDL is unavailable; attributable-fraction/death calculations will be reported as NA, while all other analyses continue.")
+theme_set(theme_bw(base_size=11))
+dirs <- c("Results/Descriptives","Results/Crossbasis","Results/Diagnostics","Results/CentreModels","Results/Meta","Results/MetaRegression","Results/TemporalAdaptation","Results/Subgroups","Results/AttributableFraction","Results/LagCharacterisation","Results/Objects")
+purrr::walk(dirs, dir.create, recursive=TRUE, showWarnings=FALSE)
+RUN_EXPENSIVE_LOCO <- FALSE
+INCLUDE_ALL_STRATIFIED_FIGURES_IN_WORD <- TRUE
+utci_percentiles <- c(P01=.01,P05=.05,P10=.10,P25=.25,P50=.50,P75=.75,P90=.90,P95=.95,P99=.99)
+percentiles <- c(.25,.75,.99); percentile_labels <- c("25th","75th","99th")
+format_ft <- function(x, font_size=9, width=.98) { if (inherits(x,"gtsummary")) x <- gtsummary::as_flex_table(x); if (!inherits(x,"flextable")) x <- flextable::flextable(x); x <- flextable::fontsize(x,font_size,part="all"); x <- flextable::font(x,"Arial",part="all"); x <- flextable::bold(x,part="header"); x <- flextable::align(x,"left",part="all"); x <- flextable::valign(x,"center",part="all"); x <- flextable::set_table_properties(x,layout="autofit",width=width,opts_word=list(split=FALSE)); flextable::autofit(x) }
+save_pub_plot <- function(p,file,width=7,height=5,dpi=300) tryCatch(ggsave(file,p,width=width,height=height,dpi=dpi,bg="white"),error=function(e) message("Plot save failed: ",file," -- ",conditionMessage(e)))
+safe_save_plot <- save_pub_plot
+word_page_break <- function() cat("\n\\newpage\n")
+```
+
+```{r lookup}
+###############################################################################
+# MASTER LOOKUP TABLE -- West Africa HDSS sites
+# Single source of truth for every centre/country/climate-zone label used
+# downstream (Table 1, centre QC, centre/country/forest plots, meta-regression).
+###############################################################################
+# centre_lookup <- tibble(
+#   centreid = c("BF021","BF031","BF041","CI011","GH011","GH021","GH031",
+#                "GM011","NG011","SN011","SN012","SN013"),
+#   centre_name = c("Nanoro","Nouna","Ouagadougou","Taabo","Navrongo","Kintampo",
+#                    "Dodowa","Farafenni","Nahuche","Bandafassi","Mlomp","Niakhar"),
+#   country = c("Burkina Faso","Burkina Faso","Burkina Faso","C\u00f4te d'Ivoire",
+#               "Ghana","Ghana","Ghana","The Gambia","Nigeria","Senegal","Senegal","Senegal"),
+#   climate_zone = c("Sudano-Sahelian","Sudano-Sahelian","Sudano-Sahelian","Forest",
+#                     "Guinea Savannah","Forest-Savannah Transition","Coastal Savannah",
+#                     "Sudano-Sahelian","Sudano-Sahelian","Sudano-Sahelian",
+#                     "Guinea Savannah","Guinea Savannah")
+# ) %>%
+#   mutate(
+#     centre_label = paste0(centre_name, " (", country, ")"),
+#     short_label  = centre_name,
+#     plot_label   = paste0(centre_name, "\n(", country, ")"),
+#     centre_label = factor(centre_label, levels = c(
+#       "Nouna (Burkina Faso)", "Nanoro (Burkina Faso)", "Ouagadougou (Burkina Faso)",
+#       "Taabo (C\u00f4te d'Ivoire)",
+#       "Farafenni (The Gambia)",
+#       "Navrongo (Ghana)", "Kintampo (Ghana)", "Dodowa (Ghana)",
+#       "Nahuche (Nigeria)",
+#       "Bandafassi (Senegal)", "Mlomp (Senegal)", "Niakhar (Senegal)"
+#     ))
+#   )
+# 
+# saveRDS(centre_lookup, "Results/Objects/centre_lookup.rds")
+# centre_lookup %>% select(centreid, centre_name, country, climate_zone) %>% format_ft()
+```
+
+```{r config}
+data_path <- "mortality_health_analysis_readydata.rds"
+if (!file.exists(data_path)) stop("Input file not found: ",data_path)
+analysis_ready_matrix <- readRDS(data_path)
+EXPOSURE_VAR <- "utci_mean"; OUTCOME_VAR <- "outcome"; STRATUM_VAR <- "stratum_id"; LAG_PREFIX <- "utci_lag"
+if (!all(c(EXPOSURE_VAR,OUTCOME_VAR,STRATUM_VAR,"centreid","date","year","is_tier1","is_tier2") %in% names(analysis_ready_matrix))) stop("Required analysis variables are missing from the input data.")
+analysis_ready_matrix <- analysis_ready_matrix %>% mutate(date=as.Date(date), year=year(date), month=month(date))
+centre_lookup <- tibble(centreid=c("BF021","BF031","BF041","CI011","GH011","GH021","GH031","GM011","NG011","SN011","SN012","SN013"),centre_name=c("Nanoro","Nouna","Ouagadougou","Taabo","Navrongo","Kintampo","Dodowa","Farafenni","Nahuche","Bandafassi","Mlomp","Niakhar"),country=c("Burkina Faso","Burkina Faso","Burkina Faso","Côte d'Ivoire","Ghana","Ghana","Ghana","The Gambia","Nigeria","Senegal","Senegal","Senegal"),climate_zone=c("Sudano-Sahelian","Sudano-Sahelian","Sudano-Sahelian","Forest","Guinea Savannah","Forest-Savannah Transition","Coastal Savannah","Sudano-Sahelian","Sudano-Sahelian","Sudano-Sahelian","Guinea Savannah","Guinea Savannah")) %>% mutate(centre_label=paste0(centre_name," (",country,")"))
+analysis_ready_matrix <- analysis_ready_matrix %>% select(-any_of(c("centre_name","country","climate_zone","centre_label"))) %>% left_join(centre_lookup,by="centreid")
+KAPPA_MAX <- 500; DISPERSION_MAX <- 1.20; MIN_CENTRE_DEATHS <- 100; MMT_SEARCH_RANGE <- c(.01,.99)
+tier_coverage <- bind_rows(lapply(c("Tier 1","Tier 2"),function(tn){ flag <- if(tn=="Tier 1") "is_tier1" else "is_tier2"; x <- analysis_ready_matrix %>% filter(.data[[flag]]==1); tibble(tier=tn,start_year=min(x$year,na.rm=TRUE),end_year=max(x$year,na.rm=TRUE),n_years=n_distinct(x$year),n_centres=n_distinct(x$centreid),observations=nrow(x),deaths=sum(x[[OUTCOME_VAR]]==1,na.rm=TRUE)) }))
+PRIMARY_TIER <- tier_coverage$tier[order(-tier_coverage$n_years,-tier_coverage$observations)][1]
+PRIMARY_TIER_FLAG <- if(PRIMARY_TIER=="Tier 1") "is_tier1" else "is_tier2"
+dat <- analysis_ready_matrix %>% filter(.data[[PRIMARY_TIER_FLAG]]==1)
+if(!"age_group"%in%names(dat)&&"age_at_death"%in%names(dat)) dat$age_group<-cut(dat$age_at_death,breaks=c(-Inf,5,65,Inf),labels=c("<5 years","5–64 years","65+ years"),right=FALSE)
+tier1_audit <- dat %>% summarise(years=paste(min(year,na.rm=TRUE),max(year,na.rm=TRUE),sep="–"),n_centres=n_distinct(centreid),observations=n(),deaths=sum(.data[[OUTCOME_VAR]]==1,na.rm=TRUE))
+```
+
+# Section 0. Shared helper functions
+
+Every model fit, diagnostic, and plot in this document goes through exactly one of these functions.
+
+```{r helpers-fit}
+build_lag_basis <- function(max_lag,lag_df=NULL,lag_knots=NULL){if(!is.null(lag_knots)) return(list(fun="ns",knots=lag_knots)); if(!is.null(lag_df)) return(list(fun="ns",df=lag_df)); if(max_lag<=3) return(list(fun="integer")); list(fun="ns",df=3)}
+compute_qaic <- function(fit){phi<-summary(fit)$dispersion; ll<-sum(dpois(fit$y,fit$fitted.values,log=TRUE)); -2*ll+2*length(coef(fit))*phi}
+compute_model_metrics <- function(fit,cb,MMT,max_lag,exposure_df,lag_df,max_RR=NA_real_){r<-qr(cb)$rank;tibble(max_lag=max_lag,exposure_df=exposure_df,lag_df=lag_df,converged=isTRUE(fit$converged),dispersion=summary(fit)$dispersion,QAIC=compute_qaic(fit),logLik=sum(dpois(fit$y,fit$fitted.values,log=TRUE)),rank=r,n_basis=ncol(cb),full_rank=r==ncol(cb),kappa=tryCatch(kappa(cb),error=function(e) NA_real_),MMT=round(MMT,2),max_RR=round(max_RR,1))}
+cb_coef_vcov <- function(cb,fit){cn<-colnames(cb); b<-coef(fit); V<-vcov(fit); n<-ncol(cb); if(length(b)==n){idx<-seq_len(n)} else {idx<-match(cn,names(b)); if(anyNA(idx)){hits<-vapply(cn,function(z){w<-grep(paste0("(^|[.:])",gsub("\\.","\\\\.",z),"$"),names(b)); if(length(w)==1) w else NA_integer_},integer(1)); idx<-hits}}; if(length(idx)!=n||anyNA(idx)) stop("Unable to identify all crossbasis coefficients."); beta<-b[idx]; Vcb<-V[idx,idx,drop=FALSE]; names(beta)<-cn; rownames(Vcb)<-colnames(Vcb)<-cn; list(coef=beta,vcov=(Vcb+t(Vcb))/2)}
+crosspred_aligned <- function(cb,fit,cen=NULL,by=.1,at=NULL){a<-cb_coef_vcov(cb,fit); args<-list(basis=cb,coef=a$coef,vcov=a$vcov,model.link="log",by=by); if(!is.null(cen)) args$cen<-cen; if(!is.null(at)) args$at<-at; do.call(dlnm::crosspred,args)}
+run_dlnm_spec <- function(data,max_lag,exposure_df=3,lag_df=3,var_knots=NULL,lag_knots=NULL,exposure_var=EXPOSURE_VAR,outcome_var=OUTCOME_VAR,stratum_var=STRATUM_VAR,lag_prefix=LAG_PREFIX,cen=NULL,by=.1,quiet=TRUE){lag_cols<-paste0(lag_prefix,0:max_lag); miss<-setdiff(lag_cols,names(data)); if(length(miss)) return(NULL); lm<-as.matrix(data[,lag_cols]); keep<-complete.cases(lm); d<-data[keep,,drop=FALSE]; lm<-lm[keep,,drop=FALSE]; if(!nrow(d)) return(NULL); if(is.null(var_knots)) var_knots<-equalknots(d[[exposure_var]],fun="ns",df=exposure_df); lb<-build_lag_basis(max_lag,lag_df,lag_knots); cb<-tryCatch(crossbasis(lm,lag=max_lag,argvar=list(fun="ns",knots=var_knots),arglag=lb),error=function(e) NULL); if(is.null(cb)||qr(cb)$rank<ncol(cb)) { if(is.null(cb)) return(NULL) }; fit<-tryCatch(gnm(as.formula(paste0(outcome_var," ~ cb")),eliminate=factor(d[[stratum_var]]),family=quasipoisson(),data=d),error=function(e) NULL); if(is.null(fit)) return(NULL); pr0<-tryCatch(crosspred_aligned(cb,fit,by=by),error=function(e) NULL); q<-quantile(d[[exposure_var]],MMT_SEARCH_RANGE,na.rm=TRUE); MMT<-NA_real_; max_RR<-NA_real_; if(!is.null(pr0)){ii<-pr0$predvar>=q[1]&pr0$predvar<=q[2]; if(any(ii)) MMT<-pr0$predvar[ii][which.min(pr0$allRRfit[ii])]; max_RR<-max(pr0$allRRfit,na.rm=TRUE)}; centre_value<-if(is.null(cen)) if(is.na(MMT)) median(d[[exposure_var]],na.rm=TRUE) else MMT else cen; pred<-tryCatch(crosspred_aligned(cb,fit,cen=centre_value,by=by),error=function(e) pr0); list(data=d,cb=cb,fit=fit,pred=pred,pred0=pr0,MMT=MMT,centre_value=centre_value,var_knots=var_knots,lag_basis=lb,metrics=compute_model_metrics(fit,cb,MMT,max_lag,exposure_df,lag_df,max_RR))}
+```
+
+```{r helpers-selection, include=FALSE}
+# Model selection is prespecified after diagnostic review; no automated decision rule is used.
+```
+
+```{r helpers-plots}
+rr_axis_breaks <- function(pred,rr_cap=10){yhi<-max(pred$allRRhigh,na.rm=TRUE);ylo<-max(0,floor(min(pred$allRRlow,na.rm=TRUE)*2)/2);hi<-ceiling(min(yhi,rr_cap)*2)/2;list(ylim=c(ylo,hi),breaks=seq(ylo,hi,.5),truncated=yhi>rr_cap,true_max=yhi)}
+plot_curve_overlay <- function(results,labels=NULL,title="",xlab="UTCI (°C)",ylab="Cumulative Relative Risk",show_mmt=TRUE,show_ci=FALSE){results<-results[!vapply(results,is.null,logical(1))]; if(!length(results)) stop("No valid models supplied."); if(is.null(labels)) labels<-names(results); if(is.null(labels)) labels<-paste("Model",seq_along(results)); df<-purrr::imap_dfr(results,function(x,nm){tibble(model=nm,UTCI=x$pred$predvar,RR=x$pred$allRRfit,low=x$pred$allRRlow,high=x$pred$allRRhigh,MMT=x$MMT)}); p<-ggplot(df,aes(UTCI,RR,group=model,linetype=model))+geom_hline(yintercept=1,linetype=2)+geom_line(linewidth=.9)+labs(title=title,x=xlab,y=ylab,linetype=NULL)+theme_bw(); if(show_ci) p<-p+geom_ribbon(aes(ymin=low,ymax=high),alpha=.15,colour=NA); if(show_mmt) p<-p+geom_vline(data=distinct(df,model,MMT),aes(xintercept=MMT),linetype=2,inherit.aes=FALSE); p}
+plot_candidate_models <- function(all_results,diagnostics_tbl,highlight_id=NULL,title="Candidate DLNM specifications"){ids<-names(all_results); ids<-ids[ids%in%diagnostics_tbl$model_id]; labs<-ids; if(!is.null(highlight_id)) labs[ids==highlight_id]<-paste0("Primary: ",highlight_id); plot_curve_overlay(all_results[ids],labs,title)}
+plot_lag_response <- function(pred,at,title=NULL){a<-pred$predvar[which.min(abs(pred$predvar-at))]; plot(pred,"slices",var=a,ci="area",xlab="Lag (days)",ylab="Relative Risk",main=title %||% paste0("Lag-response at UTCI = ",round(a,1)))}
+plot_contour_surface <- function(pred,title="Exposure-lag-response contour"){plot(pred,"contour",xlab="UTCI (°C)",ylab="Lag (days)",main=title)}
+plot_3d_surface <- function(pred,title="3D exposure-lag-response surface"){plot(pred,theta=220,phi=35,shade=.4,xlab="UTCI (°C)",ylab="Lag (days)",zlab="RR",main=title)}
+plot_centre_curves <- function(fits,title="Centre-specific cumulative exposure-response curves"){df<-purrr::imap_dfr(fits,~tibble(centre=.y,UTCI=.x$pred$predvar,RR=.x$pred$allRRfit));ggplot(df,aes(UTCI,RR,group=centre,colour=centre))+geom_line(linewidth=.7)+geom_hline(yintercept=1,linetype=2)+labs(title=title,x="UTCI (°C)",y="Relative Risk",colour="Centre")+theme_bw()}
+plot_country_curves <- function(fits,cb,cen,title="Country-level exposure-response curves"){df<-purrr::imap_dfr(fits,~tibble(country=.x$country,UTCI=.x$pred$predvar,RR=.x$pred$allRRfit));ggplot(df,aes(UTCI,RR,group=country,linetype=country))+geom_line()+geom_hline(yintercept=1,linetype=2)+labs(title=title,x="UTCI (°C)",y="Relative Risk",linetype="Country")+theme_bw()}
+plot_meta_curve <- function(pred,mmt,title="Pooled exposure-response curve"){df<-tibble(UTCI=pred$predvar,RR=pred$allRRfit,low=pred$allRRlow,high=pred$allRRhigh);ggplot(df,aes(UTCI,RR))+geom_ribbon(aes(ymin=low,ymax=high),alpha=.2)+geom_line(linewidth=1)+geom_hline(yintercept=1,linetype=2)+geom_vline(xintercept=mmt,linetype=2)+labs(title=title,x="UTCI (°C)",y="Relative Risk")+theme_bw()}
+forest_plot_mixmeta <- function(fits,meta_fit,cb,at,cen,title="Centre-specific and pooled RR"){rows<-purrr::imap_dfr(fits,function(f,id){pr<-tryCatch(crosspred_aligned(f$cb,f$fit,cen=cen,at=at),error=function(e)NULL);if(is.null(pr))return(NULL);tibble(centre=id,RR=as.numeric(pr$allRRfit[1]),low=as.numeric(pr$allRRlow[1]),high=as.numeric(pr$allRRhigh[1]))});pr<-tryCatch(crosspred(cb,coef=coef(meta_fit),vcov=vcov(meta_fit),model.link="log",cen=cen,at=at),error=function(e)NULL);if(!is.null(pr))rows<-bind_rows(rows,tibble(centre="Overall pooled",RR=as.numeric(pr$allRRfit[1]),low=as.numeric(pr$allRRlow[1]),high=as.numeric(pr$allRRhigh[1])));ggplot(rows,aes(RR,forcats::fct_reorder(centre,RR)))+geom_vline(xintercept=1,linetype=2)+geom_errorbar(aes(xmin=low,xmax=high),height=.2)+geom_point(size=2.5)+labs(title=title,x=paste0("RR at UTCI=",round(at,1)," vs MMT=",round(cen,1)),y=NULL)+theme_bw()}
+create_percentile_plot <- function(pred,exposure_data,percentile,label,prefix=""){u<-quantile(exposure_data,percentile,na.rm=TRUE); i<-which.min(abs(pred$predvar-u)); tibble(Lag=0:(ncol(pred$matRRfit)-1),RR=pred$matRRfit[i,],low=pred$matRRlow[i,],high=pred$matRRhigh[i,]) %>% ggplot(aes(Lag,RR))+geom_ribbon(aes(ymin=low,ymax=high),alpha=.2)+geom_line(linewidth=.9)+geom_hline(yintercept=1,linetype=2)+labs(title=paste0(prefix,label," percentile (UTCI ",round(pred$predvar[i],1),"°C)"),x="Lag (days)",y="Relative Risk")+theme_bw()}
+```
+
+```{r helpers-centre-meta}
+fit_one_centre <- function(centre_data,centre_id,spec,var_knots,lag_knots,cen,min_deaths=MIN_CENTRE_DEATHS,max_kappa=KAPPA_MAX){fail<-function(r) list(centre_id=centre_id,excluded=TRUE,reason=r); nd<-sum(centre_data[[OUTCOME_VAR]]==1,na.rm=TRUE); if(nd<min_deaths) return(fail(paste0("too few deaths (",nd," < ",min_deaths,")"))); res<-run_dlnm_spec(centre_data,max_lag=spec$max_lag,exposure_df=spec$exposure_df,lag_df=spec$lag_df,var_knots=var_knots,lag_knots=lag_knots,cen=cen); if(is.null(res)) return(fail("DLNM fit/crossbasis failed")); m<-res$metrics; if(!m$converged) return(fail("gnm did not converge")); if(!m$full_rank) return(fail(paste0("rank-deficient crossbasis (rank ",m$rank,"/",m$n_basis,")"))); if(!is.na(m$kappa)&&m$kappa>max_kappa) return(fail(paste0("excessive collinearity (kappa=",round(m$kappa,1),")"))); red<-tryCatch({a<-cb_coef_vcov(res$cb,res$fit); crossreduce(res$cb,coef=a$coef,vcov=a$vcov,cen=cen)},error=function(e) NULL); if(is.null(red)) return(fail("crossreduce() failed after coefficient/VCOV alignment")); pick<-function(z) if(z%in%names(centre_data)) unique(centre_data[[z]])[1] else NA_character_; list(centre_id=centre_id,excluded=FALSE,reason=NA_character_,centre_name=pick("centre_name"),country=pick("country"),climate_zone=pick("climate_zone"),centre_label=pick("centre_label"),n_deaths=nd,fit=res$fit,cb=res$cb,pred=res$pred,data=res$data,reduced=red,metrics=m,MMT=res$MMT)}
+two_stage_pool <- function(data,group_col="centreid",spec,var_knots,lag_knots,cen,min_deaths=MIN_CENTRE_DEATHS,max_kappa=KAPPA_MAX){groups<-split(data,data[[group_col]]); raw<-purrr::imap(groups,~fit_one_centre(.x,.y,spec,var_knots,lag_knots,cen,min_deaths,max_kappa)); exclusion_report<-purrr::imap_dfr(raw,~tibble(centreid=.y,n_deaths=sum(groups[[.y]][[OUTCOME_VAR]]==1,na.rm=TRUE),status=if(isTRUE(.x$excluded))"EXCLUDED" else "RETAINED",reason=if(isTRUE(.x$excluded)) .x$reason else "passed Stage 1 QC")); exclusion_report%>%format_ft(); write_csv(exclusion_report,"Results/CentreModels/Centre_Exclusion_Report.csv"); fits<-raw[!purrr::map_lgl(raw,~isTRUE(.x$excluded))]; if(length(fits)<2) stop("Fewer than two centres passed QC -- inspect Results/CentreModels/Centre_Exclusion_Report.csv."); coefs<-purrr::map(fits,~.x$reduced$coefficients); vcovs<-purrr::map(fits,~.x$reduced$vcov); if(length(unique(purrr::map_int(coefs,length)))>1) stop("Retained centre coefficient dimensions differ."); cm<-do.call(rbind,coefs); rownames(cm)<-names(fits); mf<-mixmeta(cm,vcovs,method="reml"); qc<-purrr::imap_dfr(fits,~tibble(centreid=.y,centre_name=.x$centre_name,country=.x$country,climate_zone=.x$climate_zone,deaths=.x$n_deaths,kappa=.x$metrics$kappa,dispersion=.x$metrics$dispersion,QAIC=.x$metrics$QAIC,MMT=.x$MMT)); list(fits=fits,qc=qc,exclusion_report=exclusion_report,coef_list=coefs,vcov_list=vcovs,coef_matrix=cm,meta_fit=mf,n_groups=length(fits))}
+heterogeneity_summary <- function(meta_fit){s<-summary(meta_fit);Q<-s$qstat$Q;df<-s$qstat$df;p<-s$qstat$pvalue;I2<-ifelse(Q>0,max(0,(Q-df)/Q)*100,NA);tibble(n_groups=meta_fit$nobs,Q=round(Q,2),df=df,p_value=signif(p,3),I2=round(I2,1),tau2=round(mean(diag(meta_fit$Psi)),5),AIC=round(AIC(meta_fit),2),BIC=round(BIC(meta_fit),2))}
+leave_one_out_meta <- function(cm,vcovs){purrr::map_dfr(seq_len(nrow(cm)),function(i){m<-tryCatch(mixmeta(cm[-i,,drop=FALSE],vcovs[-i],method="reml"),error=function(e)NULL);if(is.null(m)) tibble(omitted=rownames(cm)[i],status="failed") else tibble(omitted=rownames(cm)[i],status="ok",AIC=AIC(m),tau2=mean(diag(m$Psi)))})}
+```
+
+```{r pagebreak-36683, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Section 06. Descriptive statistics
+
+```{r tier1-audit}
+#tier1_audit %>% format_ft(); write_csv(tier1_audit,"Results/Descriptives/Primary_Tier_Audit.csv")
+```
+
+```{r desc-structure}
+structure_tbl <- tibble(metric=c("Rows","Variables","Centres","Countries","Climate zones","First date","Last date"),value=c(nrow(dat),ncol(dat),n_distinct(dat$centreid),n_distinct(dat$country,na.rm=TRUE),n_distinct(dat$climate_zone,na.rm=TRUE),as.character(min(dat$date,na.rm=TRUE)),as.character(max(dat$date,na.rm=TRUE))))
+structure_tbl %>% format_ft(); write_csv(structure_tbl,"Results/Descriptives/Study_Structure.csv")
+# var_list <- tibble(Variable=names(dat),Class=map_chr(dat,~class(.x)[1])); write_csv(var_list,"Results/Descriptives/Variable_List.csv")
+```
+
+```{r desc-design-and-integrity}
+referent_summary <- dat %>% count(.data[[STRATUM_VAR]],name="matched_days")
+integrity_tbl <- tibble(metric=c("Analytical rows","Case strata","Deaths","Mean matched days","Median matched days","Min matched days","Max matched days","Duplicated stratum-date rows"),value=c(nrow(dat),n_distinct(dat[[STRATUM_VAR]]),sum(dat[[OUTCOME_VAR]]==1,na.rm=TRUE),round(mean(referent_summary$matched_days),2),median(referent_summary$matched_days),min(referent_summary$matched_days),max(referent_summary$matched_days),sum(duplicated(dat[c(STRATUM_VAR,"date")]))) )
+integrity_tbl %>% format_ft(); write_csv(integrity_tbl,"Results/Descriptives/Design_Integrity.csv")
+```
+
+```{r desc-table1}
+cases <- analysis_ready_matrix %>% filter(.data[[OUTCOME_VAR]] == 1) %>%
+  mutate(sex = factor(sex, levels = c(1, 2), labels = c("Male", "Female")))
+
+table1 <- cases %>%
+  select(sex, age_group, country, climate_zone, centre_label) %>%
+  tbl_summary(label = list(sex ~ "Sex", age_group ~ "Age group", country ~ "Country",
+                            climate_zone ~ "Climate zone", centre_label ~ "HDSS centre"),
+              missing = "no") %>%
+  bold_labels() %>% add_overall() %>% as_flex_table() %>% format_ft()
+table1
+save_as_docx(table1, path = "Results/Descriptives/Table1_Population.docx")
+```
+
+```{r desc-figure-sex, fig.width=6.5, fig.height=4.2}
+p_sex <- cases %>% filter(!is.na(sex)) |> count(sex) %>% mutate(pct = 100 * n / sum(n)) %>%
+  ggplot(aes(sex, pct, fill = sex)) + geom_col(width = .6, show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(pct/100, accuracy = .1)), vjust = -.3) +
+  labs(x = NULL, y = "% of deaths", title = "Figure 1. Sex distribution of deaths")
+p_sex
+ggsave("Results/Descriptives/Sex_Distribution.png", plot = p_sex, width = 6.5, height = 4.2, dpi = 300)
+```
+
+```{r desc-figure-age, fig.width=6.5, fig.height=4.2}
+p_age <- ggplot(cases, aes(age_at_death)) + geom_histogram(bins = 40, fill = "steelblue") +
+  labs(x = "Age at death", y = "Frequency", title = "Figure 2. Age distribution of deaths")
+p_age
+ggsave("Results/Descriptives/Age_Distribution.png", plot = p_age, width = 6.5, height = 4.2, dpi = 300)
+```
+
+```{r desc-figure-age-group, fig.width=6.5, fig.height=4.2}
+p_age_group <- ggplot(cases, aes(x = age_group)) + 
+  geom_bar(fill = "steelblue") +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(x = "Age group", y = "Frequency", title = "Figure 3. Deaths by age group")
+p_age_group
+ggsave("Results/Descriptives/Age_Group_Distribution.png", plot = p_age_group, width = 6.5, height = 4.2, dpi = 300)
+```
+
+```{r desc-table2-centres}
+table2_centres <- cases %>%
+  count(centre_name, country, climate_zone, name = "deaths") %>%
+  arrange(centre_name) %>%
+  format_ft()
+table2_centres
+save_as_docx(table2_centres, path = "Results/Descriptives/Table2_Centre_Characteristics.docx")
+```
+
+```{r desc-utci}
+utci_tbl <- cases %>% select(utci_min, utci_mean, utci_max, country) %>%
+  tbl_summary(by = country, statistic = all_continuous() ~ "{mean} ({sd})") %>%
+  bold_labels() %>% add_overall() %>% as_flex_table() %>% format_ft()
+utci_tbl
+save_as_docx(utci_tbl, path = "Results/Descriptives/Table_UTCI_by_country.docx")
+
+utci_climate_tbl <- cases %>% select(utci_min, utci_mean, utci_max, climate_zone) %>%
+  tbl_summary(by = climate_zone, statistic = all_continuous() ~ "{mean} ({sd})") %>%
+  bold_labels() %>% add_overall() %>% as_flex_table() %>% format_ft()
+utci_climate_tbl
+save_as_docx(utci_climate_tbl, path = "Results/Descriptives/Table_UTCI_by_climate_zone.docx")
+
+# UTCI metric correlation: high correlation between min/mean/max is expected
+# and NOT a stability problem by itself (that is checked via crossbasis kappa
+# in Section 07, on utci_mean alone, which is what is actually modelled).
+utci_cor <- cases %>% select(utci_min, utci_mean, utci_max) %>% cor(use = "complete.obs")
+utci_cor %>% as.data.frame() %>% rownames_to_column("metric") %>% format_ft()
+corrplot(utci_cor, method = "color", type = "upper", addCoef.col = "black",
+         tl.col = "black", tl.srt = 45, diag = FALSE,
+         title = "UTCI metric correlation (min/mean/max)", mar = c(0, 0, 2, 0))
+
+ggplot(cases, aes(.data[[EXPOSURE_VAR]])) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  labs(x = "UTCI (\u00b0C)", y = "Frequency", title = "UTCI on case days")
+ggsave("Results/Descriptives/UTCI_Histogram.png", width = 8, height = 6)
+
+# v5: UTCI by country -- quick visual complement to the Table_UTCI_by_country
+# summary above (same data, easier to eyeball spread/outliers per country).
+ggplot(cases, aes(country, .data[[EXPOSURE_VAR]], fill = country)) +
+  geom_boxplot(outlier.alpha = 0.2, show.legend = FALSE) +
+  coord_flip() +
+  labs(x = NULL, y = "UTCI (\u00b0C)", title = "UTCI distribution by country")
+ggsave("Results/Descriptives/UTCI_by_Country.png", width = 8, height = 6)
+```
+
+```{r desc-percentile-table}
+# Percentile reference table used consistently throughout the report.
+p_values <- quantile(
+  analysis_ready_matrix[[EXPOSURE_VAR]],
+  probs = unname(utci_percentiles),
+  na.rm = TRUE,
+  names = FALSE
+)
+
+percentile_tbl <- tibble(
+  percentile = names(utci_percentiles),
+  probability = unname(utci_percentiles),
+  UTCI = round(p_values, 2)
+)
+
+percentile_tbl %>% format_ft()
+write_csv(percentile_tbl, "Results/Descriptives/UTCI_Percentiles.csv")
+
+# Convenient objects used throughout later sections.
+p01 <- p_values[which(names(utci_percentiles) == "P01")]
+p05 <- p_values[which(names(utci_percentiles) == "P05")]
+p10 <- p_values[which(names(utci_percentiles) == "P10")]
+p25 <- p_values[which(names(utci_percentiles) == "P25")]
+p50 <- p_values[which(names(utci_percentiles) == "P50")]
+p75 <- p_values[which(names(utci_percentiles) == "P75")]
+p90 <- p_values[which(names(utci_percentiles) == "P90")]
+p95 <- p_values[which(names(utci_percentiles) == "P95")]
+p99 <- p_values[which(names(utci_percentiles) == "P99")]
+```
+
+```{r desc-percentile-plot, fig.width=8, fig.height=5,fig.cap="UTCI percentile profile showing the exposure distribution used to define the principal reference points."}
+percentile_plot_df <- tibble(
+  probability = unname(utci_percentiles),
+  percentile = names(utci_percentiles),
+  UTCI = p_values
+)
+
+p_percentiles <- ggplot(
+  percentile_plot_df,
+  aes(probability * 100, UTCI)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_text(
+    aes(label = paste0(percentile, " = ", round(UTCI, 1), "°C")),
+    vjust = -0.7,
+    size = 3
+  ) +
+  scale_x_continuous(
+    breaks = unname(utci_percentiles) * 100,
+    labels = paste0(names(utci_percentiles), "")
+  ) +
+  labs(
+    title = "UTCI percentile profile",
+    x = "Exposure percentile",
+    y = "UTCI (°C)"
+  ) +
+  theme_bw()
+
+p_percentiles
+safe_save_plot(
+  p_percentiles,
+  "Results/Descriptives/UTCI_Percentile_Profile.png",
+  8, 5
+)
+```
+
+```{r desc-percentile-density, fig.width=8, fig.height=5,fig.cap="UTCI distribution with principal percentile reference lines."}
+p_percentile_density <- ggplot(
+  cases,
+  aes(.data[[EXPOSURE_VAR]])
+) +
+  geom_density(linewidth = 1, na.rm = TRUE) +
+  geom_vline(
+    data = percentile_tbl %>%
+      filter(percentile %in% c("P01", "P05", "P50", "P95", "P99")),
+    aes(xintercept = UTCI),
+    linetype = 2
+  ) +
+  geom_text(
+    data = percentile_tbl %>%
+      filter(percentile %in% c("P01", "P05", "P50", "P95", "P99")),
+    aes(x = UTCI, y = 0, label = percentile),
+    angle = 90,
+    vjust = -0.3,
+    hjust = 0,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "UTCI distribution and percentile reference points",
+    x = "UTCI (°C)",
+    y = "Density"
+  )
+
+p_percentile_density
+safe_save_plot(
+  p_percentile_density,
+  "Results/Descriptives/UTCI_Percentile_Density.png",
+  8, 5
+)
+```
+
+```{r desc-percentile-centres, fig.width=8, fig.height=6,fig.cap="Centre-specific UTCI percentile profiles demonstrating exposure support and between-centre differences."}
+centre_percentiles <- analysis_ready_matrix %>%
+  group_by(centreid) %>%
+  summarise(
+    P01 = quantile(.data[[EXPOSURE_VAR]], .01, na.rm = TRUE),
+    P05 = quantile(.data[[EXPOSURE_VAR]], .05, na.rm = TRUE),
+    P50 = quantile(.data[[EXPOSURE_VAR]], .50, na.rm = TRUE),
+    P95 = quantile(.data[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    P99 = quantile(.data[[EXPOSURE_VAR]], .99, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    centre_lookup %>% select(centreid, centre_name, country),
+    by = "centreid"
+  )
+
+centre_percentiles_long <- centre_percentiles %>%
+  pivot_longer(
+    starts_with("P"),
+    names_to = "percentile",
+    values_to = "UTCI"
+  ) %>%
+  mutate(
+    percentile = factor(
+      percentile,
+      levels = c("P01", "P05", "P50", "P95", "P99")
+    )
+  )
+
+p_centre_percentiles <- ggplot(
+  centre_percentiles_long,
+  aes(percentile, UTCI, group = centreid)
+) +
+  geom_line(alpha = .65) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ country, scales = "free_y") +
+  labs(
+    title = "Centre-specific UTCI percentile profiles",
+    x = NULL,
+    y = "UTCI (°C)"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_centre_percentiles
+safe_save_plot(
+  p_centre_percentiles,
+  "Results/Descriptives/Centre_UTCI_Percentile_Profiles.png",
+  8, 6
+)
+
+write_csv(
+  centre_percentiles,
+  "Results/Descriptives/Centre_UTCI_Percentiles.csv"
+)
+```
+
+```{r desc-trend, fig.width=9, fig.height=4}
+cases %>% group_by(year) %>% summarise(MeanUTCI = mean(.data[[EXPOSURE_VAR]])) %>%
+  ggplot(aes(year, MeanUTCI)) + geom_line() + geom_point() +
+  geom_smooth(method = "lm", se = FALSE, colour = "red") +
+  labs(title = "Annual mean UTCI on case days")
+ggsave("Results/Descriptives/Annual_UTCI_Trend.png", width = 9, height = 4)
+```
+
+```{r desc-time-series-overall, fig.width=9, fig.height=5,fig.cap="Overall UTCI time series across the primary analysis period."}
+daily_utci <- analysis_ready_matrix %>%
+  group_by(date) %>%
+  summarise(
+    UTCI = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_ts_overall <- ggplot(daily_utci, aes(date, UTCI)) +
+  geom_line(linewidth = .35) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    se = TRUE,
+    linewidth = .7
+  ) +
+  labs(
+    title = "Overall daily UTCI time series",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  )
+
+p_ts_overall
+safe_save_plot(
+  p_ts_overall,
+  "Results/Descriptives/TimeSeries_Overall_UTCI.png",
+  9, 5
+)
+```
+
+```{r desc-time-series-country, fig.width=9, fig.height=6,fig.cap="Country-level daily UTCI time series."}
+country_daily_utci <- analysis_ready_matrix %>%
+  group_by(country, date) %>%
+  summarise(
+    UTCI = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_ts_country <- ggplot(
+  country_daily_utci,
+  aes(date, UTCI)
+) +
+  geom_line(linewidth = .3) +
+  facet_wrap(~ country, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Daily UTCI time series by country",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  )
+
+p_ts_country
+safe_save_plot(
+  p_ts_country,
+  "Results/Descriptives/TimeSeries_UTCI_by_Country.png",
+  9, 6
+)
+```
+
+```{r desc-time-series-centre, fig.width=9, fig.height=8,fig.cap="Centre-level daily UTCI time series showing the temporal coverage of each HDSS site."}
+centre_daily_utci <- analysis_ready_matrix %>%
+  group_by(centreid, date) %>%
+  summarise(
+    UTCI = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    centre_lookup %>% select(centreid, centre_name, country),
+    by = "centreid"
+  )
+
+p_ts_centre <- ggplot(
+  centre_daily_utci,
+  aes(date, UTCI)
+) +
+  geom_line(linewidth = .25) +
+  facet_wrap(~ centre_name, ncol = 3, scales = "free_y") +
+  labs(
+    title = "Daily UTCI time series by HDSS centre",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  )
+
+p_ts_centre
+safe_save_plot(
+  p_ts_centre,
+  "Results/Descriptives/TimeSeries_UTCI_by_Centre.png",
+  9, 8
+)
+```
+
+```{r desc-time-series-climate, fig.width=9, fig.height=6,fig.cap="Climate-zone-level daily UTCI time series."}
+climate_daily_utci <- analysis_ready_matrix %>%
+  group_by(climate_zone, date) %>%
+  summarise(
+    UTCI = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_ts_climate <- ggplot(
+  climate_daily_utci,
+  aes(date, UTCI)
+) +
+  geom_line(linewidth = .35) +
+  facet_wrap(~ climate_zone, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Daily UTCI time series by climate zone",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  )
+
+p_ts_climate
+safe_save_plot(
+  p_ts_climate,
+  "Results/Descriptives/TimeSeries_UTCI_by_ClimateZone.png",
+  9, 6
+)
+```
+
+```{r desc-time-series-mortality, fig.width=9, fig.height=5,fig.cap="Annual mortality time series in the primary analysis dataset."}
+annual_mortality <- analysis_ready_matrix %>%
+  group_by(year) %>%
+  summarise(
+    deaths = sum(.data[[OUTCOME_VAR]] == 1, na.rm = TRUE),
+    observations = n(),
+    .groups = "drop"
+  )
+
+p_ts_mortality <- ggplot(
+  annual_mortality,
+  aes(year, deaths)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = sort(unique(annual_mortality$year))) +
+  labs(
+    title = "Annual mortality in primary analysis",
+    x = "Year",
+    y = "Deaths"
+  )
+
+p_ts_mortality
+safe_save_plot(
+  p_ts_mortality,
+  "Results/Descriptives/TimeSeries_Annual_Mortality.png",
+  9, 5
+)
+```
+
+```{r desc-time-series-annual-centre, fig.width=9, fig.height=8,fig.cap="Annual mortality counts by centre in the primary analysis dataset."}
+annual_centre_deaths <- analysis_ready_matrix %>%
+  filter(.data[[OUTCOME_VAR]] == 1) %>%
+  count(centreid, year, name = "deaths") %>%
+  left_join(
+    centre_lookup %>% select(centreid, centre_name),
+    by = "centreid"
+  )
+
+p_annual_centre_deaths <- ggplot(
+  annual_centre_deaths,
+  aes(year, deaths, group = centre_name)
+) +
+  geom_line(linewidth = .7) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ centre_name, scales = "free_y", ncol = 3) +
+  scale_x_continuous(
+    breaks = sort(unique(annual_centre_deaths$year))
+  ) +
+  labs(
+    title = "Annual deaths by centre",
+    x = "Year",
+    y = "Deaths"
+  )
+
+p_annual_centre_deaths
+safe_save_plot(
+  p_annual_centre_deaths,
+  "Results/Descriptives/TimeSeries_Annual_Deaths_by_Centre.png",
+  9, 8
+)
+
+write_csv(
+  annual_centre_deaths,
+  "Results/Descriptives/Annual_Deaths_by_Centre.csv"
+)
+```
+
+```{r desc-time-series-annual-centre-utci, fig.width=9, fig.height=8,fig.cap="Annual mean UTCI by centre in the primary analysis dataset."}
+annual_centre_utci <- analysis_ready_matrix %>%
+  group_by(centreid, year) %>%
+  summarise(
+    mean_utci = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    p95_utci = quantile(.data[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    centre_lookup %>% select(centreid, centre_name),
+    by = "centreid"
+  )
+
+p_annual_centre_utci <- ggplot(
+  annual_centre_utci,
+  aes(year, mean_utci, group = centre_name)
+) +
+  geom_line(linewidth = .7) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ centre_name, scales = "free_y", ncol = 3) +
+  scale_x_continuous(
+    breaks = sort(unique(annual_centre_utci$year))
+  ) +
+  labs(
+    title = "Annual mean UTCI by centre",
+    x = "Year",
+    y = "Mean UTCI (°C)"
+  )
+
+p_annual_centre_utci
+safe_save_plot(
+  p_annual_centre_utci,
+  "Results/Descriptives/TimeSeries_Annual_UTCI_by_Centre.png",
+  9, 8
+)
+
+write_csv(
+  annual_centre_utci,
+  "Results/Descriptives/Annual_UTCI_by_Centre.csv"
+)
+```
+
+```{r desc-time-series-monthly, fig.width=9, fig.height=5,fig.cap="Seasonal UTCI pattern by calendar month."}
+monthly_utci <- analysis_ready_matrix %>%
+  group_by(month = lubridate::month(date, label = TRUE, abbr = TRUE)) %>%
+  summarise(
+    mean_utci = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    p05 = quantile(.data[[EXPOSURE_VAR]], .05, na.rm = TRUE),
+    p95 = quantile(.data[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_monthly_utci <- ggplot(
+  monthly_utci,
+  aes(month, mean_utci, group = 1)
+) +
+  geom_ribbon(
+    aes(ymin = p05, ymax = p95),
+    alpha = .2
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Seasonal UTCI pattern",
+    x = "Month",
+    y = "UTCI (°C)"
+  )
+
+p_monthly_utci
+safe_save_plot(
+  p_monthly_utci,
+  "Results/Descriptives/TimeSeries_Monthly_UTCI.png",
+  9, 5
+)
+```
+
+```{r desc-time-series-case-reference, fig.width=9, fig.height=5,fig.cap="Case-day versus referent-day UTCI over the primary analysis period."}
+case_reference_daily <- analysis_ready_matrix %>%
+  mutate(
+    day_type = if_else(
+      .data[[OUTCOME_VAR]] == 1,
+      "Case day",
+      "Referent day"
+    )
+  ) %>%
+  group_by(date, day_type) %>%
+  summarise(
+    UTCI = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_case_reference_ts <- ggplot(
+  case_reference_daily,
+  aes(date, UTCI, linetype = day_type)
+) +
+  geom_line(linewidth = .4) +
+  labs(
+    title = "Case-day versus referent-day UTCI",
+    x = NULL,
+    y = "Mean UTCI (°C)",
+    linetype = NULL
+  )
+
+p_case_reference_ts
+safe_save_plot(
+  p_case_reference_ts,
+  "Results/Descriptives/TimeSeries_Case_vs_Referent_UTCI.png",
+  9, 5
+)
+```
+
+```{r desc-calendar-coverage, fig.width=9, fig.height=7,fig.cap="Calendar coverage by centre for the primary analysis dataset."}
+calendar_coverage <- analysis_ready_matrix %>%
+  distinct(centreid, year, month = lubridate::month(date)) %>%
+  left_join(
+    centre_lookup %>% select(centreid, centre_name, country),
+    by = "centreid"
+  ) %>%
+  mutate(
+    period = as.Date(
+      paste(year, month, "01", sep = "-")
+    )
+  )
+
+p_calendar_coverage <- ggplot(
+  calendar_coverage,
+  aes(period, reorder(centre_name, period))
+) +
+  geom_point(size = 1.7) +
+  scale_x_date(
+    date_breaks = "6 months",
+    date_labels = "%Y-%m"
+  ) +
+  labs(
+    title = "Primary-tier calendar coverage by centre",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+p_calendar_coverage
+safe_save_plot(
+  p_calendar_coverage,
+  "Results/Descriptives/Tier1_Calendar_Coverage.png",
+  9, 7
+)
+```
+
+```{r desc-tier-comparison, fig.width=8, fig.height=5, fig.cap="Observed temporal and multicentre coverage of the two prespecified time-varying tier definitions."}
+tier_comparison <- tier_coverage %>% mutate(selected=if_else(tier==PRIMARY_TIER,"Primary","Not primary"))
+tier_comparison %>% format_ft(); write_csv(tier_comparison,"Results/Descriptives/Tier1_vs_Tier2_Coverage.csv")
+p_tier_comparison <- tier_comparison %>% pivot_longer(c(n_years,n_centres,observations,deaths),names_to="metric",values_to="value") %>% ggplot(aes(tier,value))+geom_col()+geom_text(aes(label=scales::comma(value)),vjust=-.3,size=3)+facet_wrap(~metric,scales="free_y")+labs(title="Tier 1 versus Tier 2 coverage",x=NULL,y=NULL)+theme_bw()
+print(p_tier_comparison); save_pub_plot(p_tier_comparison,"Results/Descriptives/Tier1_vs_Tier2_Coverage.png",8,5)
+```
+
+```{r desc-time-series-annual-percentiles, fig.width=9, fig.height=5,fig.cap="Annual UTCI percentile trajectories in the primary analysis dataset."}
+annual_percentiles <- analysis_ready_matrix %>%
+  group_by(year) %>%
+  summarise(
+    P05 = quantile(.data[[EXPOSURE_VAR]], .05, na.rm = TRUE),
+    P50 = quantile(.data[[EXPOSURE_VAR]], .50, na.rm = TRUE),
+    P95 = quantile(.data[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    P99 = quantile(.data[[EXPOSURE_VAR]], .99, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    -year,
+    names_to = "percentile",
+    values_to = "UTCI"
+  )
+
+p_annual_percentiles <- ggplot(
+  annual_percentiles,
+  aes(year, UTCI, linetype = percentile)
+) +
+  geom_line(linewidth = .9) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(
+    breaks = sort(unique(annual_percentiles$year))
+  ) +
+  labs(
+    title = "Annual UTCI percentile trajectories",
+    x = "Year",
+    y = "UTCI (°C)",
+    linetype = NULL
+  )
+
+p_annual_percentiles
+safe_save_plot(
+  p_annual_percentiles,
+  "Results/Descriptives/TimeSeries_Annual_UTCI_Percentiles.png",
+  9, 5
+)
+
+write_csv(
+  annual_percentiles,
+  "Results/Descriptives/Annual_UTCI_Percentiles.csv"
+)
+```
+
+```{r pagebreak-95813, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Section 07. Crossbasis selection (multi-criteria, sequential-gate framework)
+
+```{r cb-candidates}
+candidate_specs <- expand_grid(max_lag = c(7, 14, 21, 28), exposure_df = c(3, 4, 5), lag_df = c(3, 4))
+candidate_specs <- candidate_specs %>% mutate(spec_id = paste0("Lag", max_lag, "_E", exposure_df, "_L", lag_df))
+
+all_results <- candidate_specs %>%
+  pmap(~ run_dlnm_spec(analysis_ready_matrix, max_lag = ..1, exposure_df = ..2, lag_df = ..3, quiet = TRUE))
+names(all_results) <- candidate_specs$spec_id
+```
+
+```{r cb-diagnostics-table}
+diagnostics_tbl <- imap_dfr(all_results, function(res, id) {
+  if (is.null(res)) return(NULL)
+  res$metrics %>% mutate(model_id = id)
+})
+diagnostics_tbl %>% arrange(QAIC) %>% format_ft()
+```
+
+```{r cb-qaic-heatmap, fig.width=6.5, fig.height=5}
+ggplot(diagnostics_tbl, aes(factor(exposure_df), factor(lag_df), fill = QAIC)) +
+  facet_wrap(~max_lag) + geom_tile(colour = "white") + geom_text(aes(label = round(QAIC,0)), size = 2.5) +
+  scale_fill_viridis_c() + labs(x = "Exposure df", y = "Lag df", title = "Figure 4. QAIC by lag window")
+```
+
+```{r cb-kappa-heatmap, fig.width=6.5, fig.height=5}
+ggplot(diagnostics_tbl, aes(factor(exposure_df), factor(lag_df), fill = kappa)) +
+  facet_wrap(~max_lag) + geom_tile(colour = "white") + geom_text(aes(label = round(kappa,0)), size = 2.5) +
+  scale_fill_viridis_c(option = "magma") + labs(x = "Exposure df", y = "Lag df", title = "Figure 5. Crossbasis condition number")
+```
+
+```{r cb-maxrr-heatmap, fig.width=6.5, fig.height=5}
+ggplot(diagnostics_tbl, aes(factor(exposure_df), factor(lag_df), fill = max_RR)) +
+  facet_wrap(~max_lag) + geom_tile(colour = "white") + geom_text(aes(label = round(max_RR,0)), size = 2.5) +
+  scale_fill_viridis_c(option = "inferno") + labs(x = "Exposure df", y = "Lag df",
+                                                   title = "Figure 6. Peak predicted RR by candidate model")
+```
+
+```{r cb-decision}
+gate_report <- diagnostics_tbl %>% mutate(pass_convergence=converged & full_rank,pass_kappa=is.na(kappa)|kappa<=KAPPA_MAX,pass_dispersion=is.na(dispersion)|dispersion<=DISPERSION_MAX,pass_mmt_support=!is.na(MMT) & MMT>=quantile(dat[[EXPOSURE_VAR]],.05,na.rm=TRUE) & MMT<=quantile(dat[[EXPOSURE_VAR]],.95,na.rm=TRUE),pass_rr_plausibility=is.na(max_RR)|max_RR<=2) %>% arrange(QAIC)
+gate_report %>% format_ft(); write_csv(gate_report,"Results/Crossbasis/Model_Gate_Report.csv")
+```
+
+## Manual model selection — primary decision
+
+The final model is selected **manually and explicitly**, using the complete
+candidate evidence rather than an automatic QAIC ranking.
+
+The decision criteria are, in this order:
+
+1. epidemiological plausibility of the exposure-response shape;
+2. adequate exposure support across the relevant percentiles;
+3. stable and interpretable MMT;
+4. stable lag-response behaviour;
+5. full-rank crossbasis;
+6. acceptable numerical conditioning;
+7. acceptable dispersion/convergence;
+8. absence of implausible tail explosions;
+9. parsimony;
+10. QAIC/log-likelihood as **supporting evidence only**.
+
+For this primary analysis, the manually locked primary specification is
+**Lag14_E3_L3**. Lag 21 is retained as a sensitivity specification.
+
+```{r cb-lock}
+PRIMARY_MODEL_ID <- "Lag14_E3_L3"; SENSITIVITY_MODEL_ID <- "Lag21_E3_L3"
+if(!PRIMARY_MODEL_ID %in% names(all_results)) stop("Primary model not available: ",PRIMARY_MODEL_ID)
+if(!SENSITIVITY_MODEL_ID %in% names(all_results)) stop("Sensitivity model not available: ",SENSITIVITY_MODEL_ID)
+best_id <- PRIMARY_MODEL_ID; best_fit <- all_results[[PRIMARY_MODEL_ID]]; sensitivity_fit <- all_results[[SENSITIVITY_MODEL_ID]]
+best_spec <- list(model_id=PRIMARY_MODEL_ID,max_lag=14L,exposure_df=3L,lag_df=3L,var_knots=best_fit$var_knots,lag_knots=best_fit$lag_basis$knots,MMT=best_fit$MMT,cen=best_fit$MMT)
+sensitivity_spec <- list(model_id=SENSITIVITY_MODEL_ID,max_lag=21L,exposure_df=3L,lag_df=3L,var_knots=sensitivity_fit$var_knots,lag_knots=sensitivity_fit$lag_basis$knots,MMT=sensitivity_fit$MMT,cen=sensitivity_fit$MMT)
+MMT <- best_spec$MMT; sensitivity_MMT <- sensitivity_spec$MMT
+saveRDS(best_spec,"Results/Objects/primary_specification_Lag14_E3L3.rds"); saveRDS(sensitivity_spec,"Results/Objects/sensitivity_specification_Lag21_E3L3.rds"); saveRDS(best_fit,"Results/Objects/primary_model_Lag14_E3L3.rds"); saveRDS(sensitivity_fit,"Results/Objects/sensitivity_model_Lag21_E3L3.rds")
+manual_selection_record <- tibble(role=c("Primary","Sensitivity"),model_id=c(PRIMARY_MODEL_ID,SENSITIVITY_MODEL_ID),max_lag=c(14L,21L),exposure_df=3L,lag_df=3L,MMT=c(MMT,sensitivity_MMT),selection="Prespecified manual model lock; no automated decision rule")
+manual_selection_record %>% format_ft(); write_csv(manual_selection_record,"Results/Crossbasis/Manual_Model_Selection.csv")
+```
+
+```{r selected-model-comparison, fig.width=7, fig.height=5}
+primary_sensitivity <- bind_rows(best_fit$metrics %>% mutate(role="Primary",model_id=PRIMARY_MODEL_ID),sensitivity_fit$metrics %>% mutate(role="Sensitivity",model_id=SENSITIVITY_MODEL_ID)) %>% select(role,model_id,max_lag,exposure_df,lag_df,MMT,max_RR,QAIC,dispersion,kappa,converged,full_rank)
+primary_sensitivity %>% format_ft(); write_csv(primary_sensitivity,"Results/Crossbasis/Lag14_vs_Lag21_Comparison.csv")
+p_primary_sensitivity <- plot_curve_overlay(list(Primary=best_fit,Sensitivity=sensitivity_fit),c("Lag 14 primary","Lag 21 sensitivity"),"Primary Lag 14 versus sensitivity Lag 21",show_ci=FALSE); print(p_primary_sensitivity); save_pub_plot(p_primary_sensitivity,"Results/Crossbasis/Lag14_vs_Lag21_Cumulative_Curve.png",7,5)
+```
+
+```{r prediction-objects}
+fit <- best_fit$fit; cb <- best_fit$cb; dat <- best_fit$data; MMT <- best_spec$MMT
+final_pred <- crosspred_aligned(cb,fit,cen=MMT,by=.1)
+sensitivity_pred <- crosspred_aligned(sensitivity_fit$cb,sensitivity_fit$fit,cen=sensitivity_MMT,by=.1)
+comparison_pred <- list(Primary_Lag14=list(pred=final_pred,MMT=MMT,max_lag=14L,exposure_df=3L,lag_df=3L),Sensitivity_Lag21=list(pred=sensitivity_pred,MMT=sensitivity_MMT,max_lag=21L,exposure_df=3L,lag_df=3L))
+saveRDS(comparison_pred,"Results/Objects/Primary_Lag14_vs_Sensitivity_Lag21_Predictions.rds")
+```
+
+# Figure 1. Exposure-response relationship by individual lags
+
+```{r figure1-individual-lags, fig.width=9, fig.height=7, fig.cap="Exposure-response relationship for UTCI at individual lags under the primary 14-day specification."}
+individual_lag_plot <- function(pred,max_lag,label,file){lags<-0:max_lag;d<-purrr::map_dfr(lags,function(l){i<-l+1;tibble(UTCI=pred$predvar,RR=pred$matRRfit[,i],lower=pred$matRRlow[,i],upper=pred$matRRhigh[,i],Lag=paste0("Lag ",l))});d$Lag<-factor(d$Lag,levels=paste0("Lag ",lags));p<-ggplot(d,aes(UTCI,RR))+geom_ribbon(aes(ymin=lower,ymax=upper),alpha=.2)+geom_line(linewidth=.6)+geom_hline(yintercept=1,linetype=2)+facet_wrap(~Lag,ncol=5)+labs(title=paste(label,"individual-lag exposure-response"),x="UTCI (°C)",y="Relative Risk")+theme_bw();print(p);save_pub_plot(p,file,9,7)}
+individual_lag_plot(final_pred,14,"Lag 14 primary","Results/Crossbasis/Figure1_Individual_Lags_Primary_Lag14.png")
+individual_lag_plot(sensitivity_pred,21,"Lag 21 sensitivity","Results/Crossbasis/Figure1_Individual_Lags_Sensitivity_Lag21.png")
+```
+
+# Figure 3. UTCI effects at different percentiles
+
+```{r figure3-percentiles, fig.width=8, fig.height=9, fig.cap="Lag-response effects at the 25th, 75th and 99th UTCI percentiles."}
+percentile_panels <- function(pred,x,label,file){p<-patchwork::wrap_plots(map2(percentiles,percentile_labels,~create_percentile_plot(pred,x,.x,.y,paste0(label," "))),ncol=1);print(p);save_pub_plot(p,file,8,9)}
+percentile_panels(final_pred,dat[[EXPOSURE_VAR]],"Lag 14 primary","Results/Crossbasis/Figure3_UTCI_Effects_at_Different_Percentiles_Primary_Lag14.png")
+percentile_panels(sensitivity_pred,sensitivity_fit$data[[EXPOSURE_VAR]],"Lag 21 sensitivity","Results/Crossbasis/Figure3_UTCI_Effects_at_Different_Percentiles_Sensitivity_Lag21.png")
+```
+
+
+# Section 08. DLNM diagnostics on the locked model
+
+```{r diag-load}
+fit <- best_fit$fit; cb <- best_fit$cb; dat <- best_fit$data; MMT <- best_spec$MMT
+final_pred <- crosspred_aligned(cb, fit, cen = MMT, by = 0.1)
+```
+
+```{r diag-stability}
+tibble(Rank = qr(cb)$rank, Columns = ncol(cb), Condition_number = round(kappa(cb),1),
+       Missing = sum(is.na(cb)), Converged = isTRUE(fit$converged),
+       Dispersion = round(summary(fit)$dispersion,3)) %>% format_ft()
+```
+
+```{r diag-residuals, fig.width=9, fig.height=4}
+res <- residuals(fit, type = "pearson"); fitval <- fitted(fit)
+(ggplot(tibble(res), aes(res)) + geom_histogram(bins = 50, fill = "steelblue")) +
+  (ggplot(tibble(fitval, res), aes(fitval, res)) + geom_point(alpha = .15, size = .5) +
+     geom_hline(yintercept = 0, linetype = 2, colour = "red"))
+ggsave("Results/Diagnostics/Residuals.png", width = 9, height = 4)
+```
+
+```{r diag-mmt-support, fig.width=7, fig.height=4}
+p1 <- quantile(dat[[EXPOSURE_VAR]], .01)
+p5 <- quantile(dat[[EXPOSURE_VAR]], .05); p95 <- quantile(dat[[EXPOSURE_VAR]], .95); p99 <- quantile(dat[[EXPOSURE_VAR]], .99)
+ggplot(dat, aes(.data[[EXPOSURE_VAR]])) +
+  geom_histogram(bins = 60, fill = "grey85", colour = "white") +
+  geom_vline(xintercept = MMT, colour = "red", linewidth = 1.2, linetype = 2) +
+  labs(title = "Exposure distribution and MMT", x = "UTCI (\u00b0C)")
+
+# v4.2: added the cold-tail counterpart (N_below_P05/P01) to the existing
+# hot-tail support check -- both answer "is there enough data to estimate
+# this tail of the curve reliably", and a sparse cold tail is the most
+# likely driver of an implausible max_RR (see cb-heatmaps / apply_decision_rule).
+tibble(P01 = round(p1,1), P05 = round(p5,1), MMT = round(MMT,1), P95 = round(p95,1),
+       MMT_in_5_95 = MMT >= p5 & MMT <= p95,
+       N_below_P05 = sum(dat[[EXPOSURE_VAR]] <= p5), N_below_P01 = sum(dat[[EXPOSURE_VAR]] <= p1),
+       N_above_P95 = sum(dat[[EXPOSURE_VAR]] >= p95), N_above_P99 = sum(dat[[EXPOSURE_VAR]] >= p99)) %>%
+  format_ft()
+```
+
+```{r diag-curve-slices, fig.width=9, fig.height=3.5}
+# v4.2: fixed 0.5-unit y-axis ticks anchored to the RR=1 grid, capped at
+# rr_cap=10 for readability -- see rr_axis_breaks() in helpers-plots. If the
+# curve's true range exceeds the cap (as it currently does at the cold tail
+# -- see the max_RR plausibility gate discussion in Section 07), that's
+# flagged on the plot itself rather than left to a misleadingly coarse axis.
+ax <- rr_axis_breaks(final_pred, rr_cap = 10)
+plot(final_pred, "overall", ci = "area", xlab = "UTCI", ylab = "RR", main = "Cumulative RR (centred at MMT)",
+     ylim = ax$ylim, yaxt = "n")
+axis(2, at = ax$breaks, las = 1)
+
+# v5: Cold/Heat zone shading (Cold = below MMT, Heat = above MMT -- the
+# appropriate split for a population adapted to a warm baseline). Drawn with
+# rect()+rgb(alpha=) -- NOT abline(..., alpha=), which base R's abline()
+# does not support and will error. Labels are placed at a fixed fraction of
+# the ALREADY-CAPPED ylim from rr_axis_breaks(), not max(allRRfit)*0.9,
+# which would place them off-plot (or inside the truncated spike) once a
+# curve is capped for readability.
+usr <- par("usr")
+rect(usr[1], ax$ylim[1], MMT, ax$ylim[2], col = rgb(0, 0, 1, 0.05), border = NA)
+rect(MMT, ax$ylim[1], usr[2], ax$ylim[2], col = rgb(1, 0, 0, 0.05), border = NA)
+label_y <- ax$ylim[1] + 0.92 * diff(ax$ylim)
+text(mean(c(usr[1], MMT)), label_y, "COLD", col = "blue", cex = 1.0, font = 2)
+text(mean(c(MMT, usr[2])), label_y, "HEAT", col = "red", cex = 1.0, font = 2)
+
+abline(v = MMT, col = "red", lty = 2); rug(dat[[EXPOSURE_VAR]])
+if (ax$truncated) mtext(paste0("Curve exceeds axis cap of ", max(ax$breaks),
+                                " (true max RR = ", round(ax$true_max, 1),
+                                ") -- see max_RR plausibility gate, Section 07"),
+                         side = 3, line = 0.3, cex = 0.75, col = "firebrick")
+
+par(mfrow = c(1, 3))
+plot_lag_response(final_pred, MMT + 5, title = "Moderate heat")
+plot_lag_response(final_pred, MMT + 8, title = "Extreme heat")
+plot_lag_response(final_pred, MMT - 5, title = "Cold")
+par(mfrow = c(1, 1))
+
+plot_3d_surface(final_pred)
+```
+
+```{r diag-mmt-bootstrap}
+## ---- v4: replaced 1000x data-resample-and-refit with Monte Carlo simulation
+## from the fitted coefficients' sampling distribution. This is the standard
+## approach for CIs on a *derived* nonlinear quantity from a DLNM (the same
+## mechanism attrdl(..., sim=TRUE) uses internally, and the same mechanism
+## already used elsewhere in this document for the pooled meta-analytic
+## curve via crosspred(cb, coef=, vcov=, ...)). No data resampling, no model
+## refitting: just repeated evaluation of the already-fitted curve. Runs in
+## seconds. It captures coefficient-sampling uncertainty conditional on the
+## locked crossbasis spec -- which is what you want here, since spec
+## uncertainty (knot placement, df) was already handled by the sequential-
+## gate search in Section 07.
+## v4.1: 10,000 draws (free -- each draw is a crosspred() evaluation, not a
+## refit), sub-grid MMT via splinefun()+optimize() instead of which.min() on
+## a by=0.1 grid, and a simultaneous confidence band built from the SAME
+## draws used for the MMT distribution (no extra simulation cost).
+mmt_mc_uncertainty <- function(fit, cb, exposure_data,
+                                mmt_range = MMT_SEARCH_RANGE,
+                                by = 0.1, nsim = 10000, seed = 1) {
+  set.seed(seed)
+  b  <- coef(fit)     # crossbasis coefficients only (stratum nuisance params already eliminated)
+  Vb <- vcov(fit)
+  sim_coefs <- MASS::mvrnorm(nsim, mu = b, Sigma = Vb)
+
+  q <- quantile(exposure_data, mmt_range, na.rm = TRUE)
+
+  # Fixed prediction grid, shared across all draws, so curves are directly
+  # comparable column-by-column (needed for the simultaneous band below).
+  base_pred  <- crosspred(cb, coef = b, vcov = Vb, model.link = "log", by = by)
+  predvar    <- base_pred$predvar
+  in_range   <- predvar >= q[1] & predvar <= q[2]
+  log_rr_mat <- matrix(NA_real_, nrow = nsim, ncol = length(predvar))
+  mmt_sim    <- rep(NA_real_, nsim)
+
+  for (i in seq_len(nsim)) {
+    pr <- tryCatch(crosspred(cb, coef = sim_coefs[i, ], vcov = Vb, model.link = "log", by = by),
+                    error = function(e) NULL)
+    if (is.null(pr)) next
+    log_rr_mat[i, ] <- log(pr$allRRfit)
+
+    if (any(in_range)) {
+      # Sub-grid MMT: spline-interpolate the log-RR curve within the search
+      # range and optimize(), rather than reading off the by=0.1 grid.
+      sf  <- splinefun(predvar[in_range], log_rr_mat[i, in_range], method = "natural")
+      opt <- optimize(sf, interval = range(predvar[in_range]))
+      mmt_sim[i] <- opt$minimum
+    }
+  }
+
+  list(mmt = mmt_sim, predvar = predvar, log_rr_mat = log_rr_mat)
+}
+
+mc_out <- tryCatch(mmt_mc_uncertainty(fit, cb, dat[[EXPOSURE_VAR]], nsim = 10000), error=function(e) { message("MMT Monte Carlo uncertainty unavailable: ",conditionMessage(e)); NULL })
+boot_mmt <- mc_out$mmt
+
+tibble(N_sim = length(boot_mmt), Median_MMT = median(boot_mmt, na.rm = TRUE),
+       CI_low = quantile(boot_mmt, .025, na.rm = TRUE), CI_high = quantile(boot_mmt, .975, na.rm = TRUE),
+       N_failed = sum(is.na(boot_mmt))) %>%
+  format_ft()
+
+## ---- OPTIONAL supplementary check (disabled by default): genuine
+## nonparametric case-crossover bootstrap, for anyone who specifically wants
+## knot-placement/df instability captured too, not just coefficient
+## uncertainty at the locked spec. Uses the SAME parallel_map() (and
+## therefore the SAME mirai/multisession/sequential backend selection) set
+## up in parallel-setup, and fixes the two bugs in the very first version of
+## this chunk (filter(%in%) does not duplicate resampled strata; each
+## iteration previously also computed a discarded second crosspred()). Time
+## ONE iteration first before committing to n_boot = 1000 -- e.g.
+## system.time(bootstrap_mmt_full(dat, best_spec, n_boot = 1)).
+# bootstrap_mmt_full <- function(data, spec, n_boot = 1000, seed = 1) {
+#   strata_ids <- unique(data[[STRATUM_VAR]])
+#   n_strata   <- length(strata_ids)
+#
+#   one_iter <- function(b) {
+#     samp <- sample(strata_ids, n_strata, replace = TRUE)
+#     draw_tbl <- tibble(!!STRATUM_VAR := samp) %>% count(.data[[STRATUM_VAR]], name = "reps")
+#
+#     bd <- data %>%
+#       inner_join(draw_tbl, by = STRATUM_VAR) %>%
+#       tidyr::uncount(reps, .id = "rep_id") %>%
+#       mutate(!!STRATUM_VAR := paste(.data[[STRATUM_VAR]], rep_id, sep = "_boot"))  # disambiguate duplicated strata for eliminate=
+#
+#     r <- tryCatch(run_dlnm_spec(bd, max_lag = spec$max_lag, exposure_df = spec$exposure_df,
+#                                  lag_df = spec$lag_df, quiet = TRUE),
+#                   error = function(e) NULL)
+#     if (is.null(r)) NA_real_ else r$metrics$MMT
+#   }
+#
+#   parallel_map(seq_len(n_boot), one_iter) %>% unlist()
+# }
+```
+
+```{r diag-mmt-simultaneous-band, fig.width=8, fig.height=6}
+if (exists("mc_out") && !is.null(mc_out$log_rr_mat)) {
+
+  valid_cols <- colSums(is.finite(mc_out$log_rr_mat)) >= 0.80 * nrow(mc_out$log_rr_mat)
+
+  if (sum(valid_cols) >= 10) {
+
+    mat <- mc_out$log_rr_mat[, valid_cols, drop = FALSE]
+    predvar_band <- mc_out$predvar[valid_cols]
+
+    mean_log_rr <- colMeans(mat, na.rm = TRUE)
+    sd_log_rr <- apply(mat, 2, sd, na.rm = TRUE)
+
+    sd_log_rr[!is.finite(sd_log_rr) | sd_log_rr <= 0] <- NA_real_
+
+    z_scores <- sweep(mat, 2, mean_log_rr, "-")
+    z_scores <- sweep(z_scores, 2, sd_log_rr, "/")
+
+    max_abs_z <- apply(abs(z_scores), 1, max, na.rm = TRUE)
+    crit_val <- as.numeric(
+      quantile(max_abs_z, 0.95, na.rm = TRUE)
+    )
+
+    if (is.finite(crit_val)) {
+
+      band_df <- tibble(
+        UTCI = predvar_band,
+        RR_fit = exp(mean_log_rr),
+        RR_simul_low = exp(mean_log_rr - crit_val * sd_log_rr),
+        RR_simul_high = exp(mean_log_rr + crit_val * sd_log_rr),
+        RR_pointwise_low = exp(
+          mean_log_rr - qnorm(.975) * sd_log_rr
+        ),
+        RR_pointwise_high = exp(
+          mean_log_rr + qnorm(.975) * sd_log_rr
+        )
+      ) %>%
+        filter(
+          is.finite(RR_fit),
+          is.finite(RR_simul_low),
+          is.finite(RR_simul_high),
+          is.finite(RR_pointwise_low),
+          is.finite(RR_pointwise_high)
+        )
+
+      p_simul_band <- ggplot(
+        band_df,
+        aes(UTCI, RR_fit)
+      ) +
+        geom_ribbon(
+          aes(
+            ymin = RR_simul_low,
+            ymax = RR_simul_high
+          ),
+          alpha = .35
+        ) +
+        geom_ribbon(
+          aes(
+            ymin = RR_pointwise_low,
+            ymax = RR_pointwise_high
+          ),
+          alpha = .20
+        ) +
+        geom_line(linewidth = 1) +
+        geom_hline(
+          yintercept = 1,
+          linetype = 2
+        ) +
+        geom_vline(
+          xintercept = MMT,
+          linetype = 2
+        ) +
+        labs(
+          title = "Pointwise and 95% simultaneous confidence bands",
+          x = "UTCI (°C)",
+          y = "Relative Risk"
+        )
+
+      p_simul_band
+      safe_save_plot(
+        p_simul_band,
+        "Results/Diagnostics/MMT_Simultaneous_Band.png",
+        8, 6
+      )
+    }
+  }
+}
+```
+
+
+```{r diag-loco-dlnm, fig.width=7, fig.height=5}
+if (isTRUE(RUN_EXPENSIVE_LOCO)) {
+  centres <- sort(unique(dat$centreid))
+
+  loco <- purrr::map(
+    centres,
+    function(id) {
+      safe_run_dlnm(
+        dat %>% filter(centreid != id),
+        max_lag = best_spec$max_lag,
+        exposure_df = best_spec$exposure_df,
+        lag_df = best_spec$lag_df,
+        var_knots = best_spec$var_knots,
+        lag_knots = best_spec$lag_knots,
+        cen = MMT,
+        quiet = TRUE
+      )
+    }
+  )
+
+  names(loco) <- paste0("excl_", centres)
+  loco <- loco[!vapply(loco, is.null, logical(1))]
+
+  if (length(loco) > 0) {
+    p_loco <- tryCatch(
+      plot_curve_overlay(
+        c(list(full = best_fit), loco),
+        c("Full data", names(loco)),
+        "Leave-one-centre-out DLNM sensitivity"
+      ),
+      error = function(e) {
+        message("LOCO plot unavailable: ", conditionMessage(e))
+        NULL
+      }
+    )
+    if (!is.null(p_loco)) {
+      p_loco
+      safe_save_plot(
+        p_loco,
+        "Results/Diagnostics/Leave_One_Centre_Out_DLNMs.png",
+        7, 5
+      )
+    }
+  }
+} else {
+  cat("Leave-one-centre-out refitting is disabled by default because it is computationally intensive. ",
+      "The primary analysis and all publication-relevant diagnostics are unaffected.")
+}
+```
+
+
+```{r diag-report}
+diag_report <- tibble(Metric = c("Converged","Rank","Columns","Condition number","Dispersion","MMT","MMT in 5-95pct"),
+  Value = c(as.character(isTRUE(fit$converged)), qr(cb)$rank, ncol(cb), round(kappa(cb),1),
+            round(summary(fit)$dispersion,3), round(MMT,2), as.character(MMT >= p5 & MMT <= p95)))
+save_as_docx(format_ft(diag_report), path = "Results/Diagnostics/Diagnostic_Report.docx")
+diag_report %>% format_ft()
+```
+
+```{r pagebreak-60995, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Section 09. Fit centre-specific models (Stage 1)
+
+Centre-specific models are fitted independently under the locked 14-day, exposure-df=3, lag-df=3 specification. Centres are retained for Stage 2 only when the local crossbasis is identifiable, the model converges, numerical conditioning is acceptable, and the reduced coefficient/covariance structure is valid. Any exclusions are reported explicitly with their technical reason.
+
+```{r centre-models}
+stage1_raw <- split(dat, dat$centreid)
+
+stage1_fits <- purrr::imap(
+  stage1_raw,
+  function(d, id) {
+    fit_one_centre(
+      centre_data = d,
+      centre_id = id,
+      spec = best_spec,
+      var_knots = best_spec$var_knots,
+      lag_knots = best_spec$lag_knots,
+      cen = MMT,
+      min_deaths = MIN_CENTRE_DEATHS,
+      max_kappa = KAPPA_MAX
+    )
+  }
+)
+
+stage1_qc <- purrr::imap_dfr(
+  stage1_fits,
+  function(x, id) {
+    tibble(
+      centreid = id,
+      centre_name = x$centre_name %||% NA_character_,
+      country = x$country %||% NA_character_,
+      climate_zone = x$climate_zone %||% NA_character_,
+      status = if (isTRUE(x$excluded)) "EXCLUDED" else "RETAINED",
+      reason = if (isTRUE(x$excluded)) x$reason else "passed Stage 1 QC",
+      deaths = if (!is.null(x$n_deaths)) x$n_deaths else sum(stage1_raw[[id]][[OUTCOME_VAR]] == 1, na.rm = TRUE),
+      rank = if (!is.null(x$metrics)) x$metrics$rank else NA_integer_,
+      n_basis = if (!is.null(x$metrics)) x$metrics$n_basis else NA_integer_,
+      kappa = if (!is.null(x$metrics)) x$metrics$kappa else NA_real_,
+      dispersion = if (!is.null(x$metrics)) x$metrics$dispersion else NA_real_,
+      converged = if (!is.null(x$metrics)) x$metrics$converged else FALSE
+    )
+  }
+)
+
+stage1_qc <- stage1_qc %>%
+  left_join(
+    centre_lookup %>% select(centreid, centre_name, country, climate_zone),
+    by = "centreid",
+    suffix = c("", ".lookup")
+  ) %>%
+  mutate(
+    centre_name = coalesce(centre_name, centre_name.lookup),
+    country = coalesce(country, country.lookup),
+    climate_zone = coalesce(climate_zone, climate_zone.lookup)
+  ) %>%
+  select(-ends_with(".lookup"))
+
+stage1_qc %>% arrange(desc(status), desc(deaths)) %>% format_ft()
+
+write_csv(stage1_qc, "Results/CentreModels/STAGE1_QC.csv")
+
+retained_ids <- stage1_qc %>%
+  filter(status == "RETAINED") %>%
+  pull(centreid)
+
+if (length(retained_ids) < 2) {
+  stop(
+    "Fewer than two centres passed Stage 1 QC. ",
+    "Inspect Results/CentreModels/STAGE1_QC.csv."
+  )
+}
+
+# Construct the pooling object only from centres that actually passed
+# the locked specification and numerical QC.
+retained_fits <- stage1_fits[retained_ids]
+
+coef_list <- purrr::map(retained_fits, ~ .x$reduced$coefficients)
+vcov_list <- purrr::map(retained_fits, ~ .x$reduced$vcov)
+
+coef_lengths <- purrr::map_int(coef_list, length)
+
+if (length(unique(coef_lengths)) != 1) {
+  stop(
+    "Stage 1 coefficient dimensions differ across retained centres: ",
+    paste(unique(coef_lengths), collapse = ", "),
+    ". The locked specification must generate identical reduced dimensions."
+  )
+}
+
+coef_matrix <- do.call(rbind, coef_list)
+rownames(coef_matrix) <- retained_ids
+
+# Validate every centre covariance matrix before Stage 2.
+vcov_ok <- purrr::map_lgl(
+  vcov_list,
+  function(V) {
+    is.matrix(V) &&
+      nrow(V) == ncol(V) &&
+      nrow(V) == ncol(coef_matrix) &&
+      all(is.finite(V)) &&
+      max(abs(V - t(V))) < 1e-8
+  }
+)
+
+if (!all(vcov_ok)) {
+  bad_vcov <- names(vcov_list)[!vcov_ok]
+  stop(
+    "Invalid Stage 1 covariance matrix for centre(s): ",
+    paste(bad_vcov, collapse = ", ")
+  )
+}
+
+west_africa_model <- tryCatch(
+  mixmeta(
+    coef_matrix,
+    vcov_list,
+    method = "reml"
+  ),
+  error = function(e) {
+    stop(
+      "Stage 2 mixmeta failed after successful Stage 1 QC. ",
+      "This is a true pooling/model-fitting problem: ",
+      conditionMessage(e)
+    )
+  }
+)
+
+pooled <- list(
+  fits = retained_fits,
+  qc = stage1_qc %>% filter(status == "RETAINED"),
+  exclusion_report = stage1_qc,
+  coef_list = coef_list,
+  vcov_list = vcov_list,
+  coef_matrix = coef_matrix,
+  meta_fit = west_africa_model,
+  n_groups = length(retained_fits)
+)
+
+saveRDS(pooled, "Results/Objects/pooled_stage1_stage2.rds")
+saveRDS(coef_list, "Results/CentreModels/coef_list.rds")
+saveRDS(vcov_list, "Results/CentreModels/vcov_list.rds")
+
+stage1_summary <- stage1_qc %>%
+  count(status) %>%
+  mutate(
+    percentage = round(100 * n / sum(n), 1)
+  )
+
+stage1_summary %>% format_ft()
+```
+
+```{r centre-curves, fig.width=7, fig.height=5,fig.cap="Centre-specific cumulative exposure-response curves for all centres retained after Stage 1 technical QC."}
+p_centre <- tryCatch(
+  plot_centre_curves(pooled$fits),
+  error = function(e) {
+    message("Centre curve plot failed: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (!is.null(p_centre)) {
+  p_centre
+  safe_save_plot(
+    p_centre,
+    "Results/CentreModels/Centre_Specific_Curves.png",
+    7, 5
+  )
+}
+```
+
+```{r country-curves-exploratory, fig.width=7, fig.height=5,fig.cap="Exploratory country-level cumulative exposure-response curves."}
+p_country <- tryCatch(
+  plot_country_curves(pooled$fits, cb = cb, cen = MMT),
+  error = function(e) {
+    message("Country curve plot failed: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (!is.null(p_country)) {
+  p_country
+  safe_save_plot(
+    p_country,
+    "Results/CentreModels/Country_Curves.png",
+    7, 5
+  )
+}
+```
+
+# Section 10. Multivariate random-effects meta-analysis (Stage 2)
+
+```{r meta-fit}
+west_africa_model <- pooled$meta_fit
+
+meta_summary <- tibble(
+  n_centres = nrow(pooled$coef_matrix),
+  model = "Multivariate random-effects meta-analysis (REML)",
+  logLik = as.numeric(logLik(west_africa_model)),
+  AIC = AIC(west_africa_model),
+  BIC = BIC(west_africa_model)
+)
+
+meta_summary %>% format_ft()
+heterogeneity_summary(west_africa_model) %>% format_ft()
+
+saveRDS(west_africa_model, "Results/Meta/WestAfrica_mixmeta.rds")
+```
+
+```{r meta-pooled-curve, fig.width=7, fig.height=5, fig.cap="Pooled West Africa cumulative exposure-response curve"}
+west_pred <- crosspred(cb, coef = coef(west_africa_model), vcov = vcov(west_africa_model),
+                        model.link = "log", by = .1, cen = MMT)
+plot_meta_curve(west_pred, MMT)
+saveRDS(west_pred, "Results/Meta/WestAfrica_prediction.rds")
+```
+
+```{r meta-percentile-rr, fig.width=8, fig.height=5,fig.cap="Pooled relative risk at prespecified UTCI percentiles relative to the MMT."}
+percentile_rr_df <- purrr::map_dfr(
+  names(utci_percentiles),
+  function(lbl) {
+
+    at_value <- percentile_tbl$UTCI[
+      percentile_tbl$percentile == lbl
+    ]
+
+    pr <- tryCatch(
+      crosspred(
+        cb,
+        coef = coef(west_africa_model),
+        vcov = vcov(west_africa_model),
+        model.link = "log",
+        cen = MMT,
+        at = at_value
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(pr)) return(NULL)
+
+    tibble(
+      percentile = lbl,
+      UTCI = at_value,
+      RR = as.numeric(pr$allRRfit[1]),
+      low = as.numeric(pr$allRRlow[1]),
+      high = as.numeric(pr$allRRhigh[1])
+    )
+  }
+)
+
+if (nrow(percentile_rr_df) > 0) {
+
+  percentile_rr_df$percentile <- factor(
+    percentile_rr_df$percentile,
+    levels = names(utci_percentiles)
+  )
+
+  p_percentile_rr <- ggplot(
+    percentile_rr_df,
+    aes(UTCI, RR)
+  ) +
+    geom_hline(
+      yintercept = 1,
+      linetype = 2
+    ) +
+    geom_errorbar(
+      aes(ymin = low, ymax = high),
+      width = 0
+    ) +
+    geom_point(size = 2.5) +
+    geom_text(
+      aes(label = percentile),
+      vjust = -0.9,
+      size = 3
+    ) +
+    geom_vline(
+      xintercept = MMT,
+      linetype = 2
+    ) +
+    labs(
+      title = "Pooled RR at prespecified UTCI percentiles",
+      x = "UTCI (°C)",
+      y = "Relative Risk versus MMT"
+    )
+
+  p_percentile_rr
+
+  safe_save_plot(
+    p_percentile_rr,
+    "Results/Meta/Pooled_RR_at_UTCI_Percentiles.png",
+    8, 5
+  )
+
+  percentile_rr_df %>% format_ft()
+
+  write_csv(
+    percentile_rr_df,
+    "Results/Meta/Pooled_RR_at_UTCI_Percentiles.csv"
+  )
+}
+```
+
+```{r meta-forest, fig.width=7, fig.height=6, fig.cap="Centre-specific and pooled relative risks at the 99th percentile UTCI"}
+p_forest <- tryCatch(
+  forest_plot_mixmeta(
+    pooled$fits,
+    west_africa_model,
+    cb = cb,
+    at = p99,
+    cen = MMT,
+    title = "Centre-specific versus pooled RR at the 99th percentile UTCI"
+  ),
+  error = function(e) {
+    message("Forest plot failed: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (!is.null(p_forest)) {
+  p_forest
+  safe_save_plot(
+    p_forest,
+    "Results/Meta/Forest_RR_at_P99.png",
+    7, 6
+  )
+}
+```
+
+```{r meta-blup}
+blups <- tryCatch(
+  blup(west_africa_model, vcov = TRUE),
+  error = function(e) {
+    message("Centre BLUP calculation failed: ", conditionMessage(e))
+    NULL
+  }
+)
+
+if (!is.null(blups)) {
+
+  blup_table <- purrr::imap_dfr(
+    blups,
+    function(b, id) {
+
+      rr <- tryCatch(
+        crosspred(
+          cb,
+          coef = b$blup,
+          vcov = b$vcov,
+          model.link = "log",
+          cen = MMT,
+          at = p99
+        ),
+        error = function(e) NULL
+      )
+
+      if (is.null(rr)) {
+        return(tibble(
+          centreid = id,
+          RR_at_P99 = NA_real_,
+          low = NA_real_,
+          high = NA_real_
+        ))
+      }
+
+      tibble(
+        centreid = id,
+        RR_at_P99 = as.numeric(rr$allRRfit[1]),
+        low = as.numeric(rr$allRRlow[1]),
+        high = as.numeric(rr$allRRhigh[1])
+      )
+    }
+  ) %>%
+    left_join(
+      pooled$qc %>%
+        select(centreid, centre_name, country, climate_zone, deaths),
+      by = "centreid"
+    ) %>%
+    arrange(desc(RR_at_P99))
+
+  blup_table %>% format_ft()
+
+  saveRDS(
+    blups,
+    "Results/Meta/BLUPs.rds"
+  )
+
+  write_csv(
+    blup_table,
+    "Results/Meta/BLUPs_at_P99.csv"
+  )
+}
+```
+
+
+```{r meta-loco}
+meta_loco <- purrr::possibly(
+  function() leave_one_out_meta(
+    pooled$coef_matrix,
+    pooled$vcov_list
+  ),
+  otherwise = NULL
+)()
+
+if (!is.null(meta_loco)) {
+  meta_loco %>% format_ft()
+  write_csv(
+    meta_loco,
+    "Results/Meta/Leave_One_Centre_Out_Meta.csv"
+  )
+} else {
+  cat(
+    "Leave-one-centre-out multivariate meta-analysis was not estimable; ",
+    "the primary pooled model is unchanged."
+  )
+}
+```
+
+
+## Section 10.2. Meta-regression: why do centres differ? (Table 4)
+
+`country` and `climate_zone` enter as FIXED-effect meta-predictors here, to
+test how much of the between-centre heterogeneity they explain -- this is
+the "meta-regression" step in the flow chart, run on the same pooled
+coefficient matrix as the baseline model (no separate re-pooling).
+
+```{r meta-regression}
+meta_data_hier <- pooled$qc %>%
+  distinct(
+    centreid,
+    centre_name,
+    country,
+    climate_zone
+  )
+
+cov_path <- "Data/CentreCovariates.csv"
+if (file.exists(cov_path)) {
+  meta_data_hier <- meta_data_hier %>%
+    left_join(
+      read_csv(cov_path, show_col_types = FALSE),
+      by = "centreid"
+    )
+}
+
+meta_data_hier <- meta_data_hier[
+  match(
+    rownames(pooled$coef_matrix),
+    meta_data_hier$centreid
+  ),
+  ,
+  drop = FALSE
+]
+
+if (!identical(
+  meta_data_hier$centreid,
+  rownames(pooled$coef_matrix)
+)) {
+  stop(
+    "Meta-regression centre ordering does not match the Stage 1 coefficient matrix."
+  )
+}
+
+meta_reg_results <- list()
+
+meta_reg_results$climate <- tryCatch(
+  mixmeta(
+    pooled$coef_matrix ~ factor(climate_zone),
+    vcov = pooled$vcov_list,
+    data = meta_data_hier,
+    method = "reml"
+  ),
+  error = function(e) {
+    message("Climate-zone meta-regression not estimable: ", conditionMessage(e))
+    NULL
+  }
+)
+
+meta_reg_results$country <- tryCatch(
+  mixmeta(
+    pooled$coef_matrix ~ country,
+    vcov = pooled$vcov_list,
+    data = meta_data_hier,
+    method = "reml"
+  ),
+  error = function(e) {
+    message("Country meta-regression not estimable: ", conditionMessage(e))
+    NULL
+  }
+)
+
+tau0 <- mean(diag(west_africa_model$Psi))
+
+meta_reg_summary_row <- function(label, model) {
+  if (is.null(model)) {
+    return(tibble(
+      Model = label,
+      logLik = NA_real_,
+      AIC = NA_real_,
+      Heterogeneity_explained_pct = NA_real_,
+      status = "Not estimable"
+    ))
+  }
+
+  tau <- mean(diag(model$Psi))
+
+  tibble(
+    Model = label,
+    logLik = as.numeric(logLik(model)),
+    AIC = AIC(model),
+    Heterogeneity_explained_pct =
+      round(100 * max(0, (tau0 - tau) / tau0), 1),
+    status = "Estimated"
+  )
+}
+
+table4_meta <- bind_rows(
+  meta_reg_summary_row(
+    "Pooled (no covariates)",
+    west_africa_model
+  ),
+  meta_reg_summary_row(
+    "+ Climate zone",
+    meta_reg_results$climate
+  ),
+  meta_reg_summary_row(
+    "+ Country",
+    meta_reg_results$country
+  )
+)
+
+table4_meta %>% format_ft()
+
+save_as_docx(
+  format_ft(table4_meta),
+  path = "Results/MetaRegression/Table4_MetaRegression.docx"
+)
+
+write_csv(
+  table4_meta,
+  "Results/MetaRegression/Table4_MetaRegression.csv"
+)
+
+saveRDS(
+  meta_reg_results,
+  "Results/MetaRegression/meta_regression_models.rds"
+)
+```
+
+
+## Section 10.3. Multilevel BLUPs: centre AND country (Table 3)
+
+The flow chart's next step is BLUPs "for each centre and each country" --
+that is a genuine empirical-Bayes shrinkage estimate, which requires
+`country` to be a nested RANDOM-effects level above `centreid`
+(`random = ~1|country/centreid`), not a fixed covariate. Fixed-effect
+`country` dummies (Section 10.2) test whether country explains
+heterogeneity; this nested model instead lets each country's curve borrow
+statistical strength from the whole region. `mixmeta::blup(..., level=)`
+returns predictions at either grouping level of the same fitted model.
+
+```{r multilevel-blups}
+# meta_data_hier was already re-aligned to rownames(pooled$coef_matrix) in
+# the meta-regression chunk above and is reused here unchanged.
+meta_multilevel <- tryCatch(
+  mixmeta(pooled$coef_matrix, S = pooled$vcov_list, random = ~ 1 | country/centreid,
+          data = meta_data_hier, method = "reml"),
+  error = function(e) { message("Multilevel model failed to fit: ", e$message); NULL }
+)
+
+if (!is.null(meta_multilevel)) {
+  saveRDS(meta_multilevel, "Results/Meta/WestAfrica_multilevel_mixmeta.rds")
+
+  # Centre-level BLUPs (shrunken toward their own country's mean, and the region)
+  blups_centre <- blup(meta_multilevel, level = "centreid", vcov = TRUE)
+  table_blup_centre <- imap_dfr(blups_centre, function(b, id) {
+    cp <- crosspred(cb, coef = b$blup, vcov = b$vcov, model.link = "log", cen = MMT, at = p99)
+    tibble(centreid = id, RR_at_P99 = round(cp$allRRfit, 3), low = round(cp$allRRlow, 3), high = round(cp$allRRhigh, 3))
+  }) %>% left_join(meta_data_hier, by = "centreid") %>% arrange(country, centreid)
+  table_blup_centre %>% format_ft()
+
+  # Table 3: country-level BLUPs -- the genuine shrinkage estimate the flow chart specifies
+  blups_country <- blup(meta_multilevel, level = "country", vcov = TRUE)
+  table3_country <- imap_dfr(blups_country, function(b, ctry) {
+    cp <- crosspred(cb, coef = b$blup, vcov = b$vcov, model.link = "log", cen = MMT, at = p99)
+    tibble(country = ctry, RR_at_P99 = round(cp$allRRfit, 3), low = round(cp$allRRlow, 3), high = round(cp$allRRhigh, 3))
+  })
+  table3_country %>% format_ft()
+  save_as_docx(format_ft(table3_country), path = "Results/MetaRegression/Table3_Country_BLUPs.docx")
+  save_as_docx(format_ft(table_blup_centre), path = "Results/MetaRegression/Centre_BLUPs_multilevel.docx")
+} else {
+  message("Falling back to the unconditional centre BLUPs already computed in Section 10 ",
+          "(blup(west_africa_model)) -- those do not borrow strength across countries, ",
+          "so treat country-level conclusions with more caution if this fallback is in effect.")
+}
+```
+
+```{r pagebreak-32915, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Objective 1. Attributable mortality burden
+
+Primary split: Cold (< MMT) vs Heat (>= MMT) -- the appropriate convention
+for a population adapted to a warm baseline. Reported alongside the
+Gasparrini et al. (2015, *Lancet*) four-way decomposition of the extreme
+tails: extreme cold (< P5), moderate cold (P5-MMT), moderate heat
+(MMT-P95), extreme heat (> P95). Requires `FluMoDL::attrdl()`.
+
+```{r attributable-fraction}
+af_component <- function(exp_var,cb_,outcome_,model_,cen_,range_=NULL){if(!flumodl_ok)return(NA_real_);tryCatch(FluMoDL::attrdl(exp_var,cb_,outcome_,model=model_,type="af",dir="forw",cen=cen_,range=range_),error=function(e)NA_real_)}
+make_af_table <- function(x,cbx,y,fitx,cenx){p5x<-quantile(x,.05,na.rm=TRUE);p95x<-quantile(x,.95,na.rm=TRUE);afs<-c(Total=af_component(x,cbx,y,fitx,cenx,NULL),Cold=af_component(x,cbx,y,fitx,cenx,c(-Inf,cenx)),Heat=af_component(x,cbx,y,fitx,cenx,c(cenx,Inf)),Extreme_cold=af_component(x,cbx,y,fitx,cenx,c(-Inf,p5x)),Moderate_cold=af_component(x,cbx,y,fitx,cenx,c(p5x,cenx)),Moderate_heat=af_component(x,cbx,y,fitx,cenx,c(cenx,p95x)),Extreme_heat=af_component(x,cbx,y,fitx,cenx,c(p95x,Inf))); nd<-sum(y==1,na.rm=TRUE); tibble(component=names(afs),attributable_fraction_pct=round(100*as.numeric(afs),2),attributable_deaths=round(nd*as.numeric(afs),1))}
+table5_af <- make_af_table(dat[[EXPOSURE_VAR]],cb,dat[[OUTCOME_VAR]],fit,MMT); table5_af %>% format_ft(); write_csv(table5_af,"Results/AttributableFraction/Table5_Attributable_Fraction.csv"); save_as_docx(format_ft(table5_af),path="Results/AttributableFraction/Table5_Attributable_Fraction.docx")
+af_plot_data<-table5_af%>%filter(component!="Total")
+p_af<-ggplot(af_plot_data,aes(component,attributable_fraction_pct))+geom_col()+geom_hline(yintercept=0,linetype=2)+labs(title="Attributable mortality fraction by thermal stress category",x=NULL,y="Attributable fraction (%)")+theme_bw()+theme(axis.text.x=element_text(angle=25,hjust=1)); print(p_af); save_pub_plot(p_af,"Results/AttributableFraction/Attributable_Fraction_ColdHeat.png",8,5)
+if(flumodl_ok){sensitivity_af<-make_af_table(sensitivity_fit$data[[EXPOSURE_VAR]],sensitivity_fit$cb,sensitivity_fit$data[[OUTCOME_VAR]],sensitivity_fit$fit,sensitivity_MMT); sensitivity_af%>%format_ft();write_csv(sensitivity_af,"Results/AttributableFraction/Table5_Attributable_Fraction_Sensitivity_Lag21.csv")}
+if(exists("pooled")&&length(pooled$fits)>0){af_by_centre<-purrr::imap_dfr(pooled$fits,function(cf,cid){cd<-cf$data;z<-make_af_table(cd[[EXPOSURE_VAR]],cf$cb,cd[[OUTCOME_VAR]],cf$fit,MMT);tibble(centre=cid,AF_total_pct=z$attributable_fraction_pct[z$component=="Total"],AF_cold_pct=z$attributable_fraction_pct[z$component=="Cold"],AF_heat_pct=z$attributable_fraction_pct[z$component=="Heat"],attributable_deaths_total=z$attributable_deaths[z$component=="Total"],attributable_deaths_cold=z$attributable_deaths[z$component=="Cold"],attributable_deaths_heat=z$attributable_deaths[z$component=="Heat"]) }); af_by_centre%>%format_ft();write_csv(af_by_centre,"Results/AttributableFraction/Attributable_Fraction_by_Centre.csv")}
+```
+
+```{r pagebreak-79250, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Objective 2. Lag-response and harvesting characterisation
+
+Immediate (lag 0), short (1-3), medium (4-7), delayed (8-14), and
+harvesting (15-max_lag) windows, evaluated at moderate heat, extreme heat,
+and cold. A dip below RR=1 in the harvesting window at heat exposures is
+the mortality-displacement signature; a cumulative RR that stays elevated
+through the harvesting window indicates true excess mortality rather than
+short-term displacement.
+
+```{r lag-characterisation}
+lag_windows_tbl <- bind_rows(
+  summarize_lag_windows(final_pred, MMT + 5, best_spec$max_lag, "Moderate heat (MMT+5)"),
+  summarize_lag_windows(final_pred, MMT + 8, best_spec$max_lag, "Extreme heat (MMT+8)"),
+  summarize_lag_windows(final_pred, MMT - 5, best_spec$max_lag, "Cold (MMT-5)")
+)
+lag_windows_tbl %>% format_ft()
+save_as_docx(format_ft(lag_windows_tbl), path = "Results/LagCharacterisation/Lag_Window_Summary.docx")
+
+p_lag_windows <- ggplot(lag_windows_tbl, aes(window, RR, fill = exposure_condition)) +
+  geom_col(position = "dodge") + geom_hline(yintercept = 1, linetype = 2) +
+  scale_x_discrete(limits = c("Immediate", "Short", "Medium", "Delayed", "Harvesting")) +
+  labs(title = "Figure. Cumulative RR by lag window", x = NULL, fill = NULL)
+p_lag_windows
+ggsave("Results/LagCharacterisation/Lag_Window_Barplot.png", plot = p_lag_windows, width = 8, height = 5, dpi = 300)
+```
+
+```{r pagebreak-67832, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Objective 3. Temporal adaptation
+
+```{r temporal-adaptation, fig.width=7, fig.height=5,fig.cap="Temporal adaptation: early versus late periods within the primary tier."}
+periods <- list(
+  early = c(2011, 2012),
+  late = c(2013, 2014)
+)
+
+period_pools <- purrr::imap(
+  periods,
+  function(rng, label) {
+
+    pd <- dat %>%
+      filter(
+        year >= rng[1],
+        year <= rng[2]
+      )
+
+    tryCatch(
+      two_stage_pool(
+        pd,
+        spec = best_spec,
+        var_knots = best_spec$var_knots,
+        lag_knots = best_spec$lag_knots,
+        cen = MMT
+      ),
+      error = function(e) {
+        message(
+          "Temporal period ", label,
+          " could not be pooled: ",
+          conditionMessage(e)
+        )
+        NULL
+      }
+    )
+  }
+)
+
+valid_period_pools <- period_pools[
+  !vapply(period_pools, is.null, logical(1))
+]
+
+if (length(valid_period_pools) >= 2) {
+
+  period_preds <- purrr::imap(
+    valid_period_pools,
+    function(x, label) {
+      tryCatch(
+        crosspred(
+          cb,
+          coef = coef(x$meta_fit),
+          vcov = vcov(x$meta_fit),
+          model.link = "log",
+          by = .1,
+          cen = MMT
+        ),
+        error = function(e) NULL
+      )
+    }
+  )
+
+  period_preds <- period_preds[
+    !vapply(period_preds, is.null, logical(1))
+  ]
+
+  if (length(period_preds) >= 2) {
+
+    period_curve_df <- purrr::imap_dfr(
+      period_preds,
+      function(pr, label) {
+        tibble(
+          period = label,
+          UTCI = pr$predvar,
+          RR = pr$allRRfit,
+          low = pr$allRRlow,
+          high = pr$allRRhigh
+        )
+      }
+    )
+
+    p_temporal <- ggplot(
+      period_curve_df,
+      aes(UTCI, RR, linetype = period)
+    ) +
+      geom_line(linewidth = .9) +
+      geom_hline(
+        yintercept = 1,
+        linetype = 2
+      ) +
+      geom_vline(
+        xintercept = MMT,
+        linetype = 2
+      ) +
+      labs(
+        title = "Temporal adaptation: early versus late",
+        x = "UTCI (°C)",
+        y = "Relative Risk",
+        linetype = NULL
+      )
+
+    p_temporal
+
+    safe_save_plot(
+      p_temporal,
+      "Results/TemporalAdaptation/Temporal_Adaptation_Curves.png",
+      7, 5
+    )
+
+    temporal_summary <- purrr::imap_dfr(
+      period_preds,
+      function(pr, label) {
+        idx <- which.min(
+          abs(pr$predvar - p99)
+        )
+
+        tibble(
+          period = label,
+          RR_at_P99 = pr$allRRfit[idx],
+          low = pr$allRRlow[idx],
+          high = pr$allRRhigh[idx]
+        )
+      }
+    )
+
+    temporal_summary %>% format_ft()
+
+    write_csv(
+      temporal_summary,
+      "Results/TemporalAdaptation/Temporal_Adaptation_Summary.csv"
+    )
+
+  } else {
+    cat(
+      "Temporal adaptation curve comparison was not estimable for two valid periods."
+    )
+  }
+
+} else {
+  cat(
+    "Temporal adaptation analysis was not estimable for two valid pooled periods."
+  )
+}
+```
+
+
+```{r pagebreak-66396, results="asis", echo=FALSE}
+word_page_break()
+```
+
+# Objective 4. Vulnerable and stratified analyses
+
+Each valid stratum is analysed under both locked specifications. The figure package includes: (1) cumulative risk-response, (2) exposure-lag contour, (3) 3D exposure-lag-response surface, (4) UTCI effects at the 25th, 75th and 99th percentiles across lags, (5) cold/moderate-heat/extreme-heat lag-response curves, and (6) attributable fraction and attributable deaths when `FluMoDL::attrdl()` is available. Results that cannot be estimated are recorded as NA rather than stopping the report.
+
+```{r stratified-package}
+stratified_dir <- "Results/Subgroups/Plots"; dir.create(stratified_dir,recursive=TRUE,showWarnings=FALSE)
+run_stratified_package <- function(data,label,role,spec,mmt){if(is.null(data)||!is.data.frame(data)||nrow(data)==0||sum(data[[OUTCOME_VAR]]==1,na.rm=TRUE)<20)return(NULL); r<-tryCatch(run_dlnm_spec(data,max_lag=spec$max_lag,exposure_df=spec$exposure_df,lag_df=spec$lag_df,var_knots=spec$var_knots,lag_knots=spec$lag_knots,cen=mmt),error=function(e)NULL); if(is.null(r)||is.null(r$pred))return(NULL); safe<-gsub("[^A-Za-z0-9]+","_",paste(role,label)); rrfile<-file.path(stratified_dir,paste0(safe,"_RiskResponse.png")); ctfile<-file.path(stratified_dir,paste0(safe,"_Contour.png")); d3file<-file.path(stratified_dir,paste0(safe,"_3D.png")); pctfile<-file.path(stratified_dir,paste0(safe,"_Percentiles.png")); lagfile<-file.path(stratified_dir,paste0(safe,"_LagResponse.png")); png(rrfile,1800,1300,res=200); plot(r$pred,"overall",ci="area",xlab="UTCI (°C)",ylab="Relative Risk",main=paste(role,label,"risk-response"));abline(h=1,lty=2);abline(v=mmt,lty=2);dev.off(); png(ctfile,1800,1500,res=200);plot_contour_surface(r$pred,paste(role,label,"exposure-lag contour"));dev.off(); png(d3file,1800,1500,res=200);plot_3d_surface(r$pred,paste(role,label,"3D exposure-lag-response"));dev.off(); pp<-patchwork::wrap_plots(map2(percentiles,percentile_labels,~create_percentile_plot(r$pred,data[[EXPOSURE_VAR]],.x,.y,paste0(role," "))),ncol=1); ggsave(pctfile,pp,width=8,height=9,dpi=300,bg="white"); png(lagfile,2000,900,res=200);par(mfrow=c(1,3));plot_lag_response(r$pred,mmt-5,"Cold");plot_lag_response(r$pred,mmt+5,"Moderate heat");plot_lag_response(r$pred,mmt+8,"Extreme heat");par(mfrow=c(1,1));dev.off(); afs<-rep(NA_real_,7); names(afs)<-c("AF_total","AF_cold","AF_heat","AF_extreme_cold","AF_moderate_cold","AF_moderate_heat","AF_extreme_heat"); if(flumodl_ok){x<-r$data[[EXPOSURE_VAR]];y<-r$data[[OUTCOME_VAR]];p5x<-quantile(x,.05,na.rm=TRUE);p95x<-quantile(x,.95,na.rm=TRUE);af<-function(z)tryCatch(FluMoDL::attrdl(x,r$cb,y,model=r$fit,type="af",dir="forw",cen=mmt,range=z),error=function(e)NA_real_);afs<-c(AF_total=af(NULL),AF_cold=af(c(-Inf,mmt)),AF_heat=af(c(mmt,Inf)),AF_extreme_cold=af(c(-Inf,p5x)),AF_moderate_cold=af(c(p5x,mmt)),AF_moderate_heat=af(c(mmt,p95x)),AF_extreme_heat=af(c(p95x,Inf)))}; nd<-sum(r$data[[OUTCOME_VAR]]==1,na.rm=TRUE); summary<-tibble(stratum=label,role=role,n_deaths=nd,MMT=r$MMT,QAIC=r$metrics$QAIC,max_RR=r$metrics$max_RR,dispersion=r$metrics$dispersion,kappa=r$metrics$kappa,AF_total_pct=100*afs["AF_total"],AF_cold_pct=100*afs["AF_cold"],AF_heat_pct=100*afs["AF_heat"],attributable_deaths_total=nd*afs["AF_total"],attributable_deaths_cold=nd*afs["AF_cold"],attributable_deaths_heat=nd*afs["AF_heat"]); list(summary=summary,files=c(rrfile,ctfile,d3file,pctfile,lagfile))}
+subgroup_specs <- list(); if("sex"%in%names(dat)){subgroup_specs$Sex<-list(Male=dat%>%filter(sex%in%c(1,"1")),Female=dat%>%filter(sex%in%c(2,"2")))}; if("age_at_death"%in%names(dat)){subgroup_specs$Age<-list(`<5 years`=dat%>%filter(age_at_death<5),`5-64 years`=dat%>%filter(age_at_death>=5,age_at_death<65),`65+ years`=dat%>%filter(age_at_death>=65))}; res_var<-intersect(c("residency","residency_status","residence","residence_status","resident_status"),names(dat))[1]; if(length(res_var)&&!is.na(res_var))subgroup_specs$Residency<-split(dat,dat[[res_var]]); if("country"%in%names(dat))subgroup_specs$Country<-split(dat,dat$country); if("climate_zone"%in%names(dat))subgroup_specs$ClimateZone<-split(dat,dat$climate_zone)
+run_all_strata <- function(spec,role,mmt){out<-list(); for(nm in names(subgroup_specs)){x<-subgroup_specs[[nm]]; if(is.data.frame(x))out[[nm]]<-run_stratified_package(x,nm,role,spec,mmt) else for(lv in names(x))out[[paste(nm,lv,sep="_")]]<-run_stratified_package(x[[lv]],paste(nm,lv),role,spec,mmt)}; out[!vapply(out,is.null,logical(1))]}
+primary_strata <- run_all_strata(best_spec,"Primary",MMT); sensitivity_strata <- run_all_strata(sensitivity_spec,"Sensitivity",sensitivity_MMT)
+primary_strata_table<-bind_rows(map(primary_strata,"summary")); sensitivity_strata_table<-bind_rows(map(sensitivity_strata,"summary")); bind_rows(primary_strata_table,sensitivity_strata_table)%>%format_ft(); write_csv(primary_strata_table,"Results/Subgroups/Comprehensive_Stratum_Results_Primary_Lag14_E3L3.csv"); write_csv(sensitivity_strata_table,"Results/Subgroups/Comprehensive_Stratum_Results_Sensitivity_Lag21_E3L3.csv")
+strata_manifest<-bind_rows(lapply(names(primary_strata),function(z)tibble(stratum=z,role="Primary",files=length(primary_strata[[z]]$files))),lapply(names(sensitivity_strata),function(z)tibble(stratum=z,role="Sensitivity",files=length(sensitivity_strata[[z]]$files)))); write_csv(strata_manifest,"Results/Subgroups/Stratified_Figure_Manifest.csv")
+```
+
+```{r stratified-figures-word, results="asis"}
+if(INCLUDE_ALL_STRATIFIED_FIGURES_IN_WORD){for(role_obj in list(Primary=primary_strata,Sensitivity=sensitivity_strata)){for(z in names(role_obj)){obj<-role_obj[[z]];cat("\n### ",z,"\n",sep="");for(f in obj$files)if(file.exists(f)){print(knitr::include_graphics(f));cat("\n")};word_page_break()}}}
+```
+
+# Section 15. Publication summary table and reproducibility
+
+```{r decision-log}
+n_retained <- nrow(pooled$qc)
+n_excluded <- nrow(stage1_qc) - n_retained
+
+decision_log <- tibble(
+  Decision = c(
+    "Primary dataset",
+    "Case-crossover design",
+    "Model",
+    "Exposure",
+    "Maximum lag",
+    "Exposure spline",
+    "Lag spline",
+    "Centering",
+    "Primary model selection",
+    "QAIC role",
+    "Stage 1 centre retention",
+    "Stage 1 exclusions",
+    "Sensitivity analysis"
+  ),
+  Choice = c(
+    paste0(PRIMARY_TIER," (",min(dat$year,na.rm=TRUE),"–",max(dat$year,na.rm=TRUE),"): selected because it provides the greatest year-range coverage"),
+    "Time-stratified case-crossover",
+    "Conditional quasi-Poisson DLNM (gnm; stratum eliminated)",
+    EXPOSURE_VAR,
+    paste(best_spec$max_lag, "days"),
+    paste("Natural spline, df =", best_spec$exposure_df),
+    paste("Natural spline, df =", best_spec$lag_df),
+    paste(round(MMT, 2), "°C UTCI (MMT)"),
+    paste(
+      best_id,
+      "selected manually after review of epidemiological plausibility,",
+      "percentile support, curve shape, lag behaviour, numerical stability",
+      "and parsimony"
+    ),
+    "Supporting evidence only; not an automatic selection criterion",
+    paste0(n_retained, " of ", nrow(stage1_qc), " centres retained after technical QC"),
+    paste0(n_excluded, " centres excluded because the locked crossbasis was rank deficient"),
+    "Lag 21 using the same exposure/lag spline structure"
+  )
+)
+
+decision_log %>% format_ft()
+
+write_csv(
+  decision_log,
+  "Results/Objects/Decision_Log.csv"
+)
+
+save_as_docx(
+  format_ft(decision_log),
+  path = "Results/Objects/Decision_Log.docx"
+)
+```
+
+
+```{r pub-summary}
+het_summary <- heterogeneity_summary(west_africa_model)
+
+final_summary <- tibble(
+  Model = "Conditional quasi-Poisson DLNM",
+  Exposure = EXPOSURE_VAR,
+  Primary_dataset = PRIMARY_TIER,
+  Max_lag = best_spec$max_lag,
+  Exposure_df = best_spec$exposure_df,
+  Lag_df = best_spec$lag_df,
+  MMT = round(MMT, 2),
+  Dispersion = round(summary(fit)$dispersion, 3),
+  Kappa = round(kappa(cb), 1),
+  N_centres_pooled = nrow(pooled$coef_matrix),
+  N_centres_initial = nrow(stage1_qc),
+  N_centres_excluded = n_excluded,
+  I2_pct = het_summary$I2
+)
+
+final_summary %>% format_ft()
+
+save_as_docx(
+  format_ft(final_summary),
+  path = "Results/Meta/Final_Model_Summary.docx"
+)
+
+write_csv(
+  final_summary,
+  "Results/Meta/Final_Model_Summary.csv"
+)
+```
+
+
+```{r reproducibility}
+writeLines(capture.output(sessionInfo()), "Results/Objects/SessionInfo.txt")
+sessionInfo()
+```

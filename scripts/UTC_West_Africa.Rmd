@@ -1,0 +1,1223 @@
+---
+title: "UTCI_mortalit"
+author: "Asanba"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+# Load essential biostatistical and data management packages
+library(tidyverse) # For data manipulation (dplyr, tidyr)
+library(lubridate) # For precise date handling and DOW extraction
+library(haven)     # To read INDEPTH Stata (.dta) files [Source 5 summary]
+library(hrbrthemes)
+library(readr)
+library(gtsummary)
+library(visdat)   # For missingness snapshots [Source 25, 233]
+library(naniar)   # For variable-specific missingness [Source 25, 235]
+library(dlnm)
+library(survival)
+library(officer)
+
+
+```
+
+
+
+```{r}
+
+setwd("D:/yaku-alex/west_Africa")
+UTCI_daily <- read_csv("Data/UTCI_daily_sites_2009_2016.csv")
+
+# --- PHASE 1: LOAD AND CLEAN INDEPTH MICRODATA ---
+# Use the file path corresponding to the ConsolidatedData2018 dataset
+raw_data <- read_dta("Data/ConsolidatedData2018_analysis.dta") %>% 
+  rename_all(str_to_lower) # Standardize variable names to lowercase
+```
+
+
+
+
+
+
+## Processing of Health Data 
+### STEP 2: EXPERT CORRECTION FOR DATA INTEGRITY ---
+```{r}
+
+# Define West African Centre Prefixes to ensure Nanoro (BF021) is included
+# even if its CountryId is miscoded in some tabulations [16, Dictionary]
+wa_prefixes <- c("BF", "CI", "GH", "GM", "NG", "SN")
+
+west_africa_mortality <- raw_data %>%
+  # Filter by string prefix to capture all West African sites accurately
+  filter(str_sub(centreid, 1, 2) %in% wa_prefixes) %>%
+  # Isolate confirmed deaths (EventCode 7) [14, Roadmap]
+  filter(eventcode == 7) %>%
+  # Ensure the individual was a resident at the site on the day of death
+  filter(residence == 1)
+
+# --- PHASE 2: TEMPORAL & DEMOGRAPHIC ATTRIBUTION ---
+processed_cases <- west_africa_mortality %>%
+  mutate(
+    # Convert character/double dates to R Date objects
+    eventdate = as.Date(eventdate),
+    dob = as.Date(dob),
+    # Calculate exact Age at Death for stratified analysis (Objective 4) [Roadmap]
+    age_at_death = as.numeric(difftime(eventdate, dob, units = "days")) / 365.25,
+    # Extract markers for time-stratified matching
+    year = year(eventdate),
+    month = month(eventdate),
+    dow = wday(eventdate, label = TRUE, abbr = FALSE),
+    # Unique ID for each individual death event (The Stratum)
+    stratum_id = row_number()
+  ) %>%
+  select(countryid,stratum_id, concat_individualid, centreid, locationid, 
+         sex, age_at_death, eventdate, year, month, dow)
+
+
+
+
+# Assuming your dataset is named 'health_data'
+processed_cases <- processed_cases %>%
+  mutate(
+    # Create standard age groups based on INDEPTH research standards [2]
+    age_group = case_when(
+      age_at_death <= 5  ~ "Young Children (<=5)",
+      age_at_death > 5 & age_at_death <= 18 ~ "School-age (5-18)",
+      age_at_death > 18 & age_at_death <= 65 ~ "Working-age (18-65)",
+      age_at_death > 65  ~ "Elderly (>65)",
+      TRUE ~ "Unknown" # Handles potential NA or negative age errors
+    ),
+    # Convert to factor with specific order for modeling and plots
+    age_group = factor(age_group, levels = c(
+      "Young Children (<=5)", 
+      "School-age (5-18)", 
+      "Working-age (18-65)", 
+      "Elderly (>65)"
+    ))
+  )
+
+# Verify the distribution of your new age groups
+table(processed_cases$age_group)
+
+
+
+
+
+# Mapping derived from the INDEPTH HDSS Country ID Dictionary [Turn 12]
+processed_cases <- processed_cases %>%
+  mutate(
+    country_name = case_when(
+      countryid == 854 ~ "Burkina Faso",
+      countryid == 231 ~ "Ethiopia",
+      countryid == 270 ~ "The Gambia",
+      countryid == 288 ~ "Ghana",
+      countryid == 384 ~ "Côte d'Ivoire",
+      countryid == 404 ~ "Kenya",
+      countryid == 454 ~ "Malawi",
+      countryid == 508 ~ "Mozambique",
+      countryid == 566 ~ "Nigeria",
+      countryid == 686 ~ "Senegal",
+      countryid == 710 ~ "South Africa",
+      countryid == 800 ~ "Uganda",
+      countryid == 834 ~ "Tanzania",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# --- STEP 2: EXPERT CORRECTION FOR DATA INTEGRITY ---
+# Because Nanoro (BF021) is aggregated into Ethiopia (231) in this dataset,
+# we must use the 'centreid' prefix to ensure records are correctly attributed [Turn 13, 81].
+processed_cases <- processed_cases %>%
+  mutate(
+    country_name = if_else(str_sub(centreid, 1, 2) == "BF", "Burkina Faso", country_name)
+  )
+
+# Verify the conversion
+processed_cases %>% 
+  group_by(country_name, countryid) %>% 
+  summarise(n = n()) %>% 
+  print()
+
+```
+
+
+## PHASE 3: TIME-STRATIFIED CONTROL SELECTION 
+
+```{r}
+
+# --- PHASE 3: TIME-STRATIFIED CONTROL SELECTION ---
+# Function to identify all referent days (Controls) in the same month/year
+# that fall on the same day of the week as the death [25, Roadmap]
+get_referent_days <- function(case_date) {
+  # Find the boundaries of the month
+  m_start <- floor_date(case_date, "month")
+  m_end <- ceiling_date(case_date, "month") - days(1)
+  
+  # Generate all days in that month
+  month_days <- seq(m_start, m_end, by = "1 day")
+  
+  # Select days matching the Case Day-of-Week (excluding the Case Day)
+  referent_days <- month_days[wday(month_days) == wday(case_date) & month_days != case_date]
+  return(referent_days)
+}
+
+# Expand dataset into Case-Crossover Matrix (1 Case : 3-4 Controls)
+cc_matrix <- processed_cases %>%
+  group_by(stratum_id) %>%
+  do({
+    case_row <- .
+    control_dates <- get_referent_days(case_row$eventdate)
+    
+    # Create control rows (Outcome = 0) with identical demographics
+    control_rows <- map_df(control_dates, ~ {
+      case_row %>% mutate(eventdate = .x, outcome = 0)
+    })
+    
+    # Define the case row (Outcome = 1)
+    case_row <- case_row %>% mutate(outcome = 1)
+    
+    bind_rows(case_row, control_rows)
+  }) %>%
+  ungroup()
+
+# --- PHASE 4: PRE-MERGE CLEANING ---
+# Standardize date variable for joining with ERA5-Land UTCI metrics
+final_health_data <- cc_matrix %>%
+  rename(date = eventdate) %>%
+  # Optional: Create 'time' variable for long-term trends
+  mutate(time_in_study = as.numeric(date) - min(as.numeric(date))) %>%
+  arrange(stratum_id, date)
+
+# Validation check: Ensure approximately 4-5 rows per stratum_id
+print(head(final_health_data, 10))
+summary(final_health_data$age_at_death)
+
+
+
+health_data <- final_health_data %>% 
+  filter(year >= 2009 & year <= 2016)
+
+
+#write.csv(health_data,"Data/Health_data.csv")
+
+
+# --- ADD TIER LOGIC TO PREVIOUS SCRIPT ---
+
+processed_health_data <- health_data %>%
+  mutate(
+    # Tier 1: Includes every West African site (Highest statistical power)
+    is_tier1 = if_else(year >= 2011 & year <= 2014, 1, 0),
+    
+    # Tier 2: Includes the "Stable 4" countries through 2015 (Recent trends)
+    # 270 (Gambia), 384 (Ivory Coast), 686 (Senegal), 854 (Burkina Faso)
+    is_tier2 = if_else(year >= 2009 & year <= 2015 & 
+                         str_sub(centreid, 1, 2) %in% c("GM", "CI", "SN", "BF"), 1, 0)
+  )
+
+
+```
+
+
+```{r}
+write.csv(processed_health_data,"final_health.csv")
+```
+
+
+## Processing of climate Data
+
+```{r include=FALSE}
+
+
+UTCI_daily <- UTCI_daily %>%
+  mutate(
+    # Convert dates to standard Date objects
+    date = as.Date(date),
+    
+    # Subtract 273.15 from each metric to convert Kelvin to Celsius
+    utci_min  = utci_min - 273.15,
+    utci_mean = utci_mean - 273.15,
+    utci_max  = utci_max - 273.15
+  )
+
+
+#################### CLIMATE
+
+
+
+```
+
+
+
+
+```{r}
+
+
+UTCI_daily <- UTCI_daily %>%
+  group_by(site_name) %>%
+  arrange(date) %>%
+  mutate(
+    # Current day exposure (Essential for acute heat effects) [Turn 25]
+    utci_lag0 = utci_mean, 
+    # Previous 7 days of exposure to capture delayed effects and harvesting [Turn 25]
+    utci_lag1 = lag(utci_mean, 1),
+    utci_lag2 = lag(utci_mean, 2),
+    utci_lag3 = lag(utci_mean, 3),
+    utci_lag4 = lag(utci_mean, 4),
+    utci_lag5 = lag(utci_mean, 5),
+    utci_lag6 = lag(utci_mean, 6),
+    utci_lag7 = lag(utci_mean, 7)
+  ) %>%
+  ungroup()
+
+
+```
+
+
+
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# 3. Loop through each site and display its graph in the Word document
+
+
+unique_sites <- unique(UTCI_daily$site_name)
+for (current_site in unique_sites) {
+  
+  # Filter data for just this specific site and transform
+  site_data <- UTCI_daily %>%
+    filter(site_name == current_site) %>%
+    mutate(date = as.Date(date)) %>%
+    pivot_longer(
+      cols = c(utci_min, utci_mean, utci_max),
+      names_to = "index_type",
+      values_to = "utci_value"
+    ) %>%
+    mutate(index_type = case_when(
+      index_type == "utci_max"  ~ "Maximum UTCI",
+      index_type == "utci_mean" ~ "Mean UTCI",
+      index_type == "utci_min"  ~ "Minimum UTCI"
+    ))
+  
+  # Build the site-specific plot
+  p <- ggplot(site_data, aes(x = date, y = utci_value, color = index_type, group = index_type)) +
+    
+    # Visual layers: daily noise faded out, clear trend line in focus
+    geom_line(alpha = 0.20, linewidth = 0.4) +
+    geom_smooth(method = "gam", se = FALSE, linewidth = 1.3, alpha = 0.9) +
+    
+    # Distinct, high-contrast thermal colors
+    scale_color_manual(
+      values = c("Maximum UTCI" = "#d95f02", 
+                 "Mean UTCI"    = "#7570b3", 
+                 "Minimum UTCI" = "#1b9e77")
+    ) +
+    
+    # Chronological X-axis formatting
+    scale_x_date(date_labels = "%Y", date_breaks = "2 years") +
+    
+    # Custom titles pulling the specific site name dynamically
+    labs(
+      title = paste("Universal Thermal Climate Index (UTCI) Trends:", current_site),
+      subtitle = "Daily minimum, mean, and maximum ambient thermal stress indicators",
+      x = "Timeline (Year)",
+      y = "UTCI (°C)",
+      color = "UTCI Metrics",
+      caption = "Data Source: INDEPTH-iSHARE | Trend smoothing calculated via GAM"
+    ) +
+    
+    # Professional, minimalist styling
+    theme_ipsum(grid = "XY", axis_text_size = 11) +
+    theme(
+      legend.position = "top",
+      legend.box.background = element_rect(color = "gray90", linewidth = 0.5),
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(color = "gray40", size = 11)
+    )
+  
+  # Explicitly print the plot so it renders in the R Markdown document
+  print(p)
+}
+
+```
+
+
+## MERGING OF THE EXPOSURE AND OUTCOME
+```{r}
+
+UTCI_daily <- UTCI_daily %>% rename(centreid = site_id)
+analysis_ready_matrix <- processed_health_data %>%
+  # Use a left join to keep all case/control rows
+  left_join(UTCI_daily, by = c("centreid", "date")) 
+# %>%
+#   # Check for any records that failed to match a grid cell
+#   filter(!is.na(utci_mean)) 
+
+# Verification: The number of rows should remain identical to your health_data
+nrow(analysis_ready_matrix) == nrow(health_data)
+
+```
+
+
+
+
+######## Final Analysis Dataset
+```{r}
+#write.csv(analysis_ready_matrix,"final_health_climate.csv")
+
+health_data <- read_csv("Data/Health_data.csv")
+
+```
+
+
+## DESCRIPTIVES
+```{r}
+# Load required libraries
+library(tidyverse)
+library(gtsummary)
+library(flextable)
+
+# --- STEP 1: PREPARE DATA FOR SUMMARY ---
+# We calculate daily death counts per site using only 'outcome == 1' 
+# to avoid overcounting referent days [1, 2]
+daily_counts <- health_data %>%
+  filter(outcome == 1) %>%
+  group_by(date, centreid) %>%
+  summarise(deaths_this_day = n(), .groups = "drop")
+
+# Merge daily counts back and prepare factors for the table
+table_data <- health_data %>%
+  filter(outcome == 1) %>% # Table usually summarizes the 'Cases' (Deaths)
+  left_join(daily_counts, by = c("date", "centreid")) %>%
+  mutate(
+    # Convert Sex to labeled factor [1, 3]
+    sex = factor(sex, levels = c(1, 2), labels = c("Male", "Female")),
+    # Ensure CentreId is treated as the site grouping variable [4, 5]
+    centreid = as.factor(centreid)
+  ) %>%
+  select(deaths_this_day, sex, age_group, centreid)
+
+# --- STEP 2: GENERATE GOLD-STANDARD TABLE ---
+baseline_tbl <- table_data %>%
+  tbl_summary(
+    by = centreid, # Stratify by the Research Centre [4]
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)",
+      all_continuous()  ~ "{mean} ({max})" # Showing average and peak daily mortality
+    ),
+    label = list(
+      deaths_this_day ~ "Average & Maximum Deaths Per Site/Day",
+      sex ~ "Sex",
+      age_group ~ "Age Group"
+    ),
+    type = list(deaths_this_day ~ "continuous")
+  ) %>%
+  add_overall() %>%
+  bold_labels() %>%
+  as_flex_table() %>%
+  # --- STEP 3: UPDATE FOOTER WITH WEST AFRICAN SITE METADATA [Turn 18] ---
+  flextable::add_footer_lines(
+    values = paste0(
+      "BF021=Nanoro; BF031=Nouna; BF041=Ouagadougou; CI011=Taabo; ",
+      "GH011=Navrongo; GH021=Kintampo; GH031=Dodowa; GM011=Farafenni; ",
+      "NG011=Nahuche; SN011=Bandafassi; SN012=Mlomp; SN013=Niakhar"
+    )
+  ) %>%
+  flextable::fontsize(size = 9, part = "footer") %>%
+  flextable::italic(part = "footer") %>%
+  flextable::autofit()
+
+# View the table
+baseline_tbl
+
+```
+
+
+## climate Descriptives
+```{r}
+
+# --- STEP 1: PREPARE UNIQUE CLIMATE DATA ---
+# Extract unique site-day observations to avoid overcounting replicated days
+climate_summary_data <- analysis_ready_matrix %>%
+  group_by(centreid, date) %>%
+  slice(1) %>% # Keep one record per site per day
+  ungroup()
+
+# --- STEP 2: CALCULATE SUMMARY STATISTICS ---
+summary_stats <- climate_summary_data %>%
+  group_by(centreid) %>%
+  # Mapping ERA5-Land variables to professional labels [Roadmap]
+  rename("UTCI" = utci_mean) %>%
+  summarise(
+    across(c(UTCI),
+           list(
+             Min = ~min(., na.rm = TRUE),
+             Q25 = ~quantile(., 0.25, na.rm = TRUE),
+             Median = ~median(., na.rm = TRUE),
+             Q75 = ~quantile(., 0.75, na.rm = TRUE),
+             Max = ~max(., na.rm = TRUE)
+           ),
+           .names = "{.col}_{.fn}"
+    )
+  ) %>%
+  ungroup()
+
+# --- STEP 3: RESHAPE FOR FLEXTABLE ---
+table_data <- summary_stats %>%
+  pivot_longer(
+    cols = -centreid,
+    names_to = c("variable", "stat"),
+    names_sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>%
+  mutate(variable = factor(variable, levels = c("UTCI"))) %>%
+  arrange(centreid, variable)
+
+# --- STEP 4: POPULATE NESTED STRUCTURE ---
+final_table <- data.frame(Metric = character(), Min = numeric(), `25%` = numeric(), 
+                          Median = numeric(), `75%` = numeric(), Max = numeric(), 
+                          stringsAsFactors = FALSE)
+
+sites <- unique(table_data$centreid)
+for(site in sites) {
+  # Add site header row
+  final_table <- rbind(final_table, data.frame(Metric = site, Min = NA, `25%` = NA, 
+                                               Median = NA, `75%` = NA, Max = NA))
+  # Add metrics for this site
+  site_rows <- table_data %>% filter(centreid == site)
+  for(i in 1:nrow(site_rows)) {
+    final_table <- rbind(final_table,
+                         data.frame(Metric = as.character(site_rows$variable[i]),
+                                    Min = site_rows$Min[i], `25%` = site_rows$Q25[i],
+                                    Median = site_rows$Median[i], `75%` = site_rows$Q75[i],
+                                    Max = site_rows$Max[i]))
+  }
+  # Add spacer
+  if(site != tail(sites, 1)) {
+    final_table <- rbind(final_table, data.frame(Metric = "", Min = NA, `25%` = NA, 
+                                                 Median = NA, `75%` = NA, Max = NA))
+  }
+}
+
+# --- STEP 5: GENERATE GOLD-STANDARD FLEXTABLE ---
+ft_climate <- final_table %>%
+  flextable() %>%
+  set_header_labels(Metric = "Site / Parameter", Min = "Min", `25%` = "25%", 
+                    Median = "Median", `75%` = "75%", Max = "Max") %>%
+  # Bold the West African CentreIDs [Turn 18]
+  bold(i = which(final_table$Metric %in% sites)) %>%
+  align(align = "center", part = "all") %>%
+  align(j = 1, align = "left") %>%
+  # Indent parameters under site headers
+  padding(i = which(!final_table$Metric %in% c(sites, "")), j = 1, padding.left = 20) %>%
+  colformat_num(j = 2:6, na_str = "", digits = 2) %>%
+  add_footer_lines("Data source: ERA5-Land Reanalysis (0.1° resolution) merged with INDEPTH HDSS site centroids.") %>%
+  autofit()
+
+ft_climate
+```
+
+
+
+
+
+
+####### QUALITY CONTROL AND MODELING CHECKS
+
+<!-- Before proceeding with your main Distributed Lag Non-linear Model (DLNM) analysis, an expert biostatistical approach requires a series of assumption tests and diagnostic checks to ensure the validity of your West African heat-mortality estimates. These tests safeguard against bias, overdispersion, and temporal confounding. -->
+<!-- 1. Data Quality and Demographic Integrity Tests -->
+<!-- Before modeling, you must validate the internal consistency of the INDEPTH HDSS records to ensure the population foundation is robust -->
+<!-- . -->
+<!-- Missingness Analysis: Use the vis_miss() or gg_miss_var() functions to identify if missing values in covariates like age_at_death or sex are random or systematic -->
+<!-- . -->
+<!-- Age Heaping/Digit Preference: In West African contexts, check for "age heaping" at digits ending in 0 and 5 using Whipple's Index or Myers' Blended Index -->
+<!-- . Significant heaping suggests recall bias that could affect age-stratified relative risk estimates -->
+<!-- . -->
+<!-- Sex Ratio Validation: Calculate the sex ratio at death; standard ratios typically range between 95 and 102 males per 100 females -->
+<!-- . Extreme deviations may signify coverage errors in the surveillance data -->
+<!-- . -->
+<!-- 2. Exploratory Temporal Confounding Tests -->
+<!-- Environmental time series are prone to "unmeasured temporal factors" that can bias climate-health associations -->
+<!-- . -->
+<!-- Seasonal and Long-Term Trend Detection: Plot your mortality counts and UTCI metrics against time_in_study -->
+<!-- . Use a geom_smooth() line to detect if mortality is declining over the decade or if seasonal peaks (winter vs. summer) are present, which necessitates the use of natural cubic splines to control for time -->
+<!-- . -->
+<!-- Day-of-the-Week (DOW) Effect: Use a boxplot or violin plot to determine if mortality is significantly higher on certain days (e.g., weekends) -->
+<!-- . If a pattern exists, DOW must be included as a categorical covariate -->
+<!-- . -->
+<!-- 3. Model Assumption and Error Distribution Tests -->
+<!-- Choosing the correct regression "family" is critical for accurate standard errors and p-values -->
+<!-- . -->
+<!-- Overdispersion Test: For count data, check if the variance of daily deaths exceeds the mean -->
+<!-- . If the dispersion parameter (ϕ) is significantly greater than 1, you must use a Quasipoisson family instead of a standard Poisson to prevent artificially narrow confidence intervals -->
+<!-- . -->
+<!-- Autocorrelation Check: Use residual plots or specific statistical tools to explore if errors are correlated over time -->
+<!-- . In repeated measures or clustered data (like multiple deaths per household), this ensures observations are truly independent -->
+<!-- . -->
+<!-- 4. DLNM-Specific Diagnostic Tests -->
+<!-- Preparing the cross-basis for heat and lags requires testing for stability and collinearity -->
+<!-- . -->
+<!-- Lag-Collinearity Assessment: Calculate the correlation between temperature at different lags (e.g., Lag 0 vs. Lag 7) -->
+<!-- . Strong correlations (r>0.8) indicate that fitting a separate coefficient for every lag day will lead to model instability, justifying a smooth function of lag (spline) instead -->
+<!-- . -->
+<!-- Degrees of Freedom (df) Sensitivity: Test various df for your time spline -->
+<!-- . A df that is too high may capture acute heatwaves and mask the effect you are trying to measure, while a df that is too low may leave residual seasonal confounding in the model -->
+<!-- . -->
+<!-- Minimum Mortality Temperature (MMT) Identification: Before the final "Gold Standard" output, run a preliminary model to identify the UTCI value where cumulative relative risk is lowest [102, Turn 16]. This MMT becomes the referent center (cen = MMT) for all subsequent relative risk calculations [102, Turn 16]. -->
+<!-- 5. Spatial Consistency and Sensitivity Checks -->
+<!-- Scenario Comparison: Perform a sensitivity analysis comparing your two powerful scenarios: the Maximum Breadth (2011–2014) and the Recent Warming (2009–2015) [Turn 13, Turn 14]. Significant differences in the UTCI-mortality thresholds between these tiers can reveal an "Adaptation Gap" or shifting vulnerability over time [Turn 16]. -->
+<!-- Standardized Mean Difference (SMD): If you utilize any propensity-score weighting in your stratification, ensure the SMD between groups is below 0.1, which indicates a reasonable balance of covariates across the thermal exposure group -->
+
+
+
+
+## Optimal df Selection via AIC
+
+```{r}
+
+# --- STEP 1: PREPARE LAG MATRIX FOR OPTIMIZATION ---
+# Use Tier 1 data (Full Regional Breadth) for parameter selection [Turn 13]
+optim_data <- analysis_ready_matrix %>% filter(is_tier1 == 1)
+
+# Construct the lag matrix (Lags 0-7) as you suggested
+# This is correct because Case-Crossover rows are not continuous [Turn 25]
+lag_matrix <- as.matrix(optim_data[, paste0("utci_lag", 0:7)])
+
+# --- STEP 2: ESTIMATE DISPERSION (phi) FROM SATURATED MODEL ---
+# Fit a complex model to calculate the scaling factor for QAIC [Turn 23]
+saturated_cb <- crossbasis(lag_matrix, lag = 7, 
+                           argvar = list(fun = "ns", df = 5), 
+                           arglag = list(fun = "ns", df = 5))
+
+saturated_fit <- clogit(outcome ~ saturated_cb + strata(stratum_id), data = optim_data)
+phi <- summary(saturated_fit)$robse^2 / summary(saturated_fit)$coefficients^2
+message("Dispersion factor (phi) for West Africa: ", round(phi[5], 3))
+
+# --- STEP 3: RUN THE QAIC GRID SEARCH ---
+df_var_range <- 2:4  # UTCI curve flexibility
+df_lag_range <- 3:6  # Lag response smoothness
+
+model_results <- expand.grid(df_var = df_var_range, df_lag = df_lag_range)
+model_results$QAIC <- NA
+
+for (i in seq_len(nrow(model_results))) {
+  v_df <- model_results$df_var[i]
+  l_df <- model_results$df_lag[i]
+  
+  cb_loop <- crossbasis(lag_matrix, lag = 7,
+                        argvar = list(fun = "ns", df = v_df),
+                        arglag = list(fun = "ns", df = l_df))
+  
+  # Fit Conditional Logistic Regression [Turn 18, 100]
+  fit <- clogit(outcome ~ cb_loop + strata(stratum_id), data = optim_data)
+  
+  # Manual QAIC Calculation: (-2 * logLik / phi) + 2 * k [Turn 23]
+  # k = parameters (df_var * df_lag)
+  model_results$QAIC[i] <- (-2 * fit$loglik[6] / mean(phi)) + (2 * (v_df * l_df))
+}
+
+# --- STEP 4: IDENTIFY AND ADOPT BEST PARAMETERS ---
+best_row <- model_results[which.min(model_results$QAIC), ]
+cat("Superior combination: df_var =", best_row$df_var, ", df_lag =",best_row$df_lag)
+```
+
+
+
+
+
+
+```{r}
+
+# --- PHASE 6: MODEL OPTIMIZATION (TIER 1 BASELINE) ---
+
+# --- PHASE 4: DIAGNOSTIC - ESTIMATE DISPERSION (phi) ---
+
+# 1. Isolate Tier 1 Data (Regional Baseline)
+optim_data <- analysis_ready_matrix %>% filter(is_tier1 == 1)
+
+# 2. Construct the Lag Matrix (Lags 0-7)
+# Use 'lag_matrix' consistently [Turn 28]
+lag_matrix <- as.matrix(optim_data[, paste0("utci_lag", 0:7)])
+
+# 3. ESTIMATE DISPERSION (phi) FROM SATURATED MODEL
+saturated_cb <- crossbasis(lag_matrix, lag = 7,
+                           argvar = list(fun = "ns", df = 5),
+                           arglag = list(fun = "ns", df = 5))
+
+saturated_fit <- clogit(outcome ~ saturated_cb + strata(stratum_id) + cluster(stratum_id), 
+                        data = optim_data, 
+                        method = "efron") # Efron is mandatory for tied deaths [Turn 31]
+
+coef_matrix <- summary(saturated_fit)$coefficients
+phi <- mean(coef_matrix[, "robust se"]^2 / coef_matrix[, "se(coef)"]^2)
+message("Estimated Dispersion Factor (phi): ", round(phi, 3))
+
+# 4. RUN THE QAIC GRID SEARCH
+df_var_range <- 2:4  
+df_lag_range <- 3:6  
+model_results <- expand.grid(df_var = df_var_range, df_lag = df_lag_range)
+model_results$QAIC <- NA
+
+for (i in seq_len(nrow(model_results))) {
+  v_df <- model_results$df_var[i]
+  l_df <- model_results$df_lag[i]
+  
+  cb_loop <- crossbasis(lag_matrix, lag = 7,
+                        argvar = list(fun = "ns", df = v_df),
+                        arglag = list(fun = "ns", df = l_df))
+  
+  fit <- clogit(outcome ~ cb_loop + strata(stratum_id), 
+                data = optim_data, method = "efron")
+  
+  # CORRECTED INDEX: Use [3] for fitted log-likelihood [Turn 23, 29]
+  # Formula: (-2 * logLik / phi) + 2 * k
+  k <- v_df * l_df
+  model_results$QAIC[i] <- (-2 * fit$loglik[3] / phi) + (2 * k)
+}
+
+# 5. IDENTIFY SUPERIOR PARAMETERS
+best_row <- model_results[which.min(model_results$QAIC), ]
+cat("Superior optimized combination: df_var =", best_row$df_var, ", df_lag =", best_row$df_lag, "\n")
+
+
+```
+
+
+
+
+
+```{r}
+
+optim_data <- analysis_ready_matrix %>% filter(is_tier1 == 1)
+
+lag_matrix <- as.matrix(optim_data[, paste0("utci_lag", 0:7)])
+
+df_exposure_range <- 2:6  # df for argvar
+df_lag_range <- 3:8       # df for arglag
+
+# Store results
+model_results <- expand.grid(df_var = df_exposure_range, df_lag = df_lag_range)
+model_results$AIC <- NA
+
+model_list <- list()
+
+# Looping through all combinations of df
+for (i in seq_len(nrow(model_results))) {
+  df_var <- model_results$df_var[i]
+  df_lag <- model_results$df_lag[i]
+  
+  # Crossbasis
+  cb <- crossbasis(lag_matrix,
+                   lag = 7,
+                   argvar = list(fun = "ns", df = df_var),
+                   arglag = list(fun = "ns", df = df_lag))
+  
+  # Model
+
+model <- clogit(outcome ~ cb + strata(stratum_id) + cluster(stratum_id),data = optim_data,method = "efron")
+  
+  # Save model and AIC
+  model_list[[i]] <- model
+  model_results$AIC[i] <- AIC(model)
+}
+
+# View AIC results
+print(model_results)
+
+# Find best combination
+best_row <- model_results[which.min(model_results$AIC), ]
+cat("Best combination: df_var =", best_row$df_var, ", df_lag =", best_row$df_lag, "\n")
+
+```
+
+
+
+
+
+
+```{r}
+final_analysis_matrix <- analysis_ready_matrix
+# 1. Prepare Data & Baseline Parameters
+optim_data <- final_analysis_matrix %>% filter(is_tier1 == 1)
+lag_matrix <- as.matrix(optim_data[, paste0("utci_lag", 0:7)])
+
+# 2. Use your calculated phi (0.96) for QAIC consistency [1]
+phi <- 0.96 
+
+# 3. Refined Grid Search
+# Standard ranges: 2-5 for exposure, 3-5 for lag to prevent 'wiggliness' [160, Turn 28]
+df_var_range <- 2:5  
+df_lag_range <- 3:6  
+
+model_results <- expand.grid(df_var = df_var_range, df_lag = df_lag_range)
+model_results$QAIC <- NA
+
+message("Running Model Selection Grid Search...")
+
+for (i in seq_len(nrow(model_results))) {
+  v_df <- model_results$df_var[i]
+  l_df <- model_results$df_lag[i]
+  
+  # Construct Basis
+  cb_loop <- crossbasis(lag_matrix,
+                        lag = 7,
+                        argvar = list(fun = "ns", df = v_df),
+                        arglag = list(fun = "ns", df = l_df))
+  
+  # Fit Model with Robust Variance & Efron for tied deaths [Turn 31]
+  fit <- clogit(outcome ~ cb_loop + strata(stratum_id) + cluster(stratum_id),
+                data = optim_data, method = "efron")
+  
+  # Manual QAIC Calculation [4, 5]
+  # fit$loglik[6] is the fitted log-likelihood
+  k <- v_df * l_df
+  model_results$QAIC[i] <- (-2 * fit$loglik[2] / 0.96) + (2 * k)
+}
+
+# 4. IDENTIFY THE OPTIMAL PARSIMONIOUS COMBINATION
+# Expert Rule: If QAIC values are within 2 units, choose the simpler model [Turn 33].
+best_row <- model_results[which.min(model_results$QAIC), ]
+
+# Final Output
+print(model_results %>% arrange(QAIC))
+cat("\n--- FINAL EXPERT RECOMMENDATION ---\n")
+cat("Superior Parsimonious Combination: df_var =", best_row$df_var, ", df_lag =", best_row$df_lag, "\n")
+```
+
+# --- PHASE 7: MAIN ANALYSIS & MMT IDENTIFICATION ---
+
+```{r}
+
+# --- PHASE 7: MAIN ANALYSIS & MMT IDENTIFICATION ---
+
+# 1. Lock in your winning parameters
+final_v_df <- 2
+final_l_df <- 2
+
+# 2. Fit the Primary Regional Model (Tier 1 Baseline)
+# Using the Efron method to handle tied deaths in HDSS sites [Turn 31]
+cb_final <- crossbasis(lag_matrix, lag = 7,
+                       argvar = list(fun = "ns", df = final_v_df),
+                       arglag = list(fun = "ns", df = final_l_df))
+
+fit_final <- clogit(outcome ~ cb_final + strata(stratum_id) + cluster(stratum_id), 
+                    data = optim_data, method = "efron")
+
+# 3. Identify the Minimum Mortality Temperature (MMT)
+# This extracts the UTCI value where cumulative RR is exactly 1.0 [102, Turn 16]
+pred_main <- crosspred(cb_final, fit_final, by = 0.1)
+MMT <- pred_main$predvar[which.min(pred_main$allRRfit)]
+
+message("--- ANALYSIS COMPLETE ---")
+message("The Regional Minimum Mortality Temperature (MMT) is: ", MMT, "°C UTCI")
+# Critical Visual Validation (The 3D Check)
+# Because df_lag=6 is relatively high for a 7-day window, you must perform a visual check to ensure the model isn't "jumpy" [Turn 35].
+# Generate the 3D surface plot to check for over-fitting
+# Centered at the MMT you just identified
+plot(crosspred(cb_final, fit_final, cen = MMT), 
+     xlab = "UTCI (°C)", ylab = "Lag (Days)", zlab = "Relative Risk",
+     main = "3D Heat-Mortality Risk Surface (df: 5, 6)",
+     theta = 40, phi = 30, col = "lightblue", shade = 0.5)
+```
+
+
+
+
+```{r}
+
+# This plot will show you if the risk actually rises at the hot end
+plot(pred_main, ptype = "overall", 
+     xlab = "UTCI (°C)", ylab = "Cumulative RR",
+     main = "Regional Thermal-Mortality Association")
+abline(v = MMT, col = "red", lty = 2) # Mark where the model thinks MMT is
+```
+
+
+
+```{r}
+
+
+# --- 1. DATA QUALITY & DEMOGRAPHIC INTEGRITY ---
+
+# A. Missingness Analysis
+# Visualize if missing values (NAs) are clustered in specific sites or variables
+# vis_miss(final_analysis_matrix) 
+# gg_miss_var(final_analysis_matrix, facet = centreid)
+
+# B. Sex Ratio Validation
+# Standard ratio at death should be near 1.0 (95-102 males per 100 females)
+sex_ratio <- final_analysis_matrix %>%
+  filter(outcome == 1) %>%
+  group_by(centreid) %>%
+  summarise(ratio = sum(sex == 1) / sum(sex == 2))
+print(sex_ratio)
+
+# C. Age Heaping (Whipple's Index for age 23-62)
+# Check for reporting bias at ages ending in 0 or 5
+whipple_check <- final_analysis_matrix %>%
+  filter(outcome == 1 & age_at_death >= 23 & age_at_death <= 62) %>%
+  mutate(digit = round(age_at_death) %% 10) %>%
+  summarise(index = (sum(digit %in% c(0, 5)) * 500) / n())
+# Index > 110 suggests reporting inconsistencies.
+
+# --- 2. EXPLORATORY TEMPORAL TRENDS ---
+
+# A. Seasonal and Long-Term Trend Detection
+# Check if mortality or UTCI has a non-linear trend over the study decade [Source 25, 65]
+ggplot(filter(final_analysis_matrix, outcome == 1), aes(x = date, y = utci_mean)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "gam", color = "red") + 
+  facet_wrap(~centreid) +
+  labs(title = "Site-Specific Thermal Trends and Smoothing")
+
+# B. Day-of-the-Week (DOW) Effect
+# Determine if mortality is significantly associated with specific days [Source 25, 69]
+ggplot(filter(final_analysis_matrix, outcome == 1), aes(x = dow, fill = dow)) +
+  geom_bar() +
+  facet_wrap(~centreid) +
+  theme(axis.text.x = element_text(angle = 45))
+
+# --- 3. MODEL ASSUMPTION TESTS ---
+
+# A. Overdispersion Test
+# Check if variance exceeds the mean (Dispersion Parameter > 1) [Source 25, 93]
+# We use a Poisson GLM on site-day counts for this check
+site_day_counts <- final_analysis_matrix %>%
+  filter(outcome == 1) %>%
+  group_by(centreid, date) %>%
+  summarise(daily_deaths = n(), utci = first(utci_mean))
+
+pois_mod <- glm(daily_deaths ~ utci, family = "poisson", data = site_day_counts)
+dispersion_param <- sum(residuals(pois_mod, type = "pearson")^2) / pois_mod$df.residual
+message("Overdispersion Parameter: ", round(dispersion_param, 2)) 
+
+# B. Autocorrelation Check
+# Ensure mortality on Day T isn't heavily dictated by Day T-1 [Source 25, 70]
+pacf(site_day_counts$daily_deaths, main = "Partial Autocorrelation of Daily Deaths")
+
+# --- 4. DLNM-SPECIFIC DIAGNOSTICS ---
+
+# A. Lag-Collinearity Assessment
+# High correlation (>0.8) justifies using splines for the lag dimension [Source 25, 152, 153]
+lag_matrix <- final_analysis_matrix %>%
+  filter(outcome == 1) %>%
+  select(utci_mean, utci_lag1, utci_lag2, utci_lag3) # Add more lags as needed
+cor_matrix <- cor(lag_matrix, use = "complete.obs")
+print(cor_matrix)
+
+
+```
+
+
+
+```{r}
+# --- PHASE 4: DIAGNOSTIC - ESTIMATE DISPERSION (phi) ---
+
+# 1. Isolate Tier 1 Data (The Regional Baseline 2011–2014)
+# We use Tier 1 to find a stable regional dispersion baseline [Turn 13, 23]
+optim_data <- final_analysis_matrix %>% filter(is_tier1 == 1)
+
+# 2. Construct the Lag Matrix (Lags 0-7)
+lag_mat <- as.matrix(optim_data[, paste0("utci_lag", 0:7)])
+
+# 3. Define a 'Saturated' Basis
+# We use high degrees of freedom (df=5) to capture the maximum explainable 
+# variance before calculating 'leftover' noise (dispersion) [Turn 23]
+saturated_cb <- crossbasis(lag_mat, lag = 7,
+                           argvar = list(fun = "ns", df = 5),
+                           arglag = list(fun = "ns", df = 5))
+
+# 4. Fit Conditional Logistic Regression with Robust Variance
+# 'cluster(stratum_id)' is mandatory to invoke the robust sandwich estimator [Turn 30]
+# 'method = "efron"' is required to handle tied deaths and robust SEs [Turn 31]
+saturated_fit <- clogit(outcome ~ saturated_cb + strata(stratum_id) + cluster(stratum_id), 
+                        data = optim_data, 
+                        method = "efron")
+
+# 5. Calculate the Dispersion Factor (phi)
+# Expert Logic: phi = Mean(Robust Variance / Model-based Variance) [37, Turn 31]
+coef_matrix <- summary(saturated_fit)$coefficients
+phi <- mean(coef_matrix[, "robust se"]^2 / coef_matrix[, "se(coef)"]^2)
+
+# Output the Result
+message("Estimated Dispersion Factor (phi) for West Africa: ", round(phi, 3))
+
+# --- STEP 2: RUN THE QAIC SELECTION LOOP FOR TIER 1 ---
+df_exposure_range <- 2:5 
+df_lag_range      <- 3:6
+model_results <- expand.grid(df_var = df_exposure_range, df_lag = df_lag_range)
+model_results$QAIC <- NA
+
+tier1_data <- filter(final_analysis_matrix, is_tier1 == 1)
+
+for (i in seq_len(nrow(model_results))) {
+  v_df <- model_results$df_var[i]
+  l_df <- model_results$df_lag[i]
+  
+  cb_temp <- crossbasis(tier1_data$utci_mean, lag = 7, 
+                        argvar = list(fun = "ns", df = v_df), 
+                        arglag = list(fun = "ns", df = l_df))
+  
+  fit <- clogit(outcome ~ cb_temp + strata(stratum_id), data = tier1_data)
+  
+  # Manual QAIC Calculation [Source 25, 41, 42]
+  loglik <- fit$loglik
+  k <- v_df * l_df
+  model_results$QAIC[i] <- (-2 * loglik / phi) + (2 * k)
+}
+
+# --- STEP 3: OUTPUT BEST COMBINATION ---
+best_tier1 <- model_results[which.min(model_results$QAIC), ]
+print("Optimal Degrees of Freedom for Tier 1 based on QAIC:")
+print(best_tier1)
+```
+
+
+
+
+
+
+
+
+### **Phase 7: Main Analysis and MMT Identification**
+
+
+
+#### **1. Fit the Primary Regional Model (Tier 1)**
+
+```{r}
+final_analysis_matrix <- analysis_ready_matrix
+# STEP 1: Lock in the optimal df found in the previous loop
+opt_v_df <- 4 # Example result from your loop
+opt_l_df <- 6 # Example result from your loop
+
+# STEP 2: Fit the Primary DLNM for Tier 1
+# Ensure you are using the pre-generated lag matrix [Turn 28]
+tier1_data <- final_analysis_matrix %>% filter(is_tier1 == 1)
+lag_matrix_t1 <- as.matrix(tier1_data[, paste0("utci_lag", 0:7)])
+
+cb_primary <- crossbasis(lag_matrix_t1, lag = 7,
+                         argvar = list(fun = "ns", df = opt_v_df),
+                         arglag = list(fun = "ns", df = opt_l_df))
+
+fit_primary <- clogit(outcome ~ cb_primary + strata(stratum_id), data = tier1_data)
+```
+
+
+
+#### **2. Identify the Minimum Mortality Temperature (MMT)**
+```{r}
+
+# STEP 3: Generate overall predictions across the full UTCI range
+pred_primary <- crosspred(cb_primary, fit_primary, by = 0.1)
+
+# STEP 4: Extract the MMT (the UTCI value where RR is minimum)
+MMT <- pred_primary$predvar[which.min(pred_primary$allRRfit)]
+cat("The Regional Minimum Mortality Temperature (MMT) is:", MMT, "°C\n")
+```
+
+
+#### **3. MMT-Centering for Relative Risk (RR) Reporting**
+
+```{r}
+
+# STEP 5: Generate centered predictions for reporting
+# This ensures RR = 1.0 at the MMT [Turn 16]
+final_pred <- crosspred(cb_primary, fit_primary, cen = MMT, by = 1)
+```
+
+
+#### **4. Execute Stratified Comparisons**
+With the regional MMT established, you will apply the **same $df$ and centering** to your subgroups to see how vulnerability shifts.
+*   **Tier 2 (2015 Warming):** Determine if the MMT shifted higher during the recent warming period [Turn 14, 16].
+*   **Age Groups:** Compare the heat-vulnerability "slope" of the **Elderly (>65)** versus **Young Children (≤5)** [Turn 17, 455].
+*   **Sex:** Check if males or females in the Sahel show higher cumulative risk at the 99th percentile of UTCI.
+
+### **Expert Insight for Interpretation**
+*   **The "U-Shape":** Expect the Tier 1 curve to show a classic U-shape, where risk rises significantly above the MMT (Heat) and below the MMT (Cold).
+*   **Acute vs. Delayed:** Use the **lag-response slices** to see if West African heat shock is truly acute (peaking at Lag 0–1) or if there is a "harvesting" dip later in the week.
+*   **Biological Realism:** If your MMT is very high (e.g., >30°C UTCI), it suggests the population has a high degree of physiological or behavioral adaptation to the Sahelian climate [Turn 16, 261].
+
+**Your next move:** Run the code above to extract your **MMT**. Once you have that value, we can move to **Phase 8: Final Visualization (3D Plots and 99th Percentile Slices)** to finalize your study results.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+Complete Gold-Standard Analysis Script
+# --- PHASE 0: LOAD CORE LIBRARIES ---
+library(tidyverse)
+library(lubridate)
+library(haven)     # For .dta INDEPTH files [1]
+library(dlnm)      # For distributed lag models [2]
+library(survival)  # For conditional logistic regression [Turn 28]
+library(splines)   # For natural cubic splines [3]
+library(gtsummary) # For professional baseline tables [Turn 18]
+library(flextable) # For table formatting [Turn 19]
+
+# --- PHASE 1: PREPARE MASTER CLIMATE DATA & LAGS ---
+# Expert Standard: Create lags on the continuous daily file to ensure 
+# accuracy before joining with health strata [Turn 24, 27].
+climate_master <- read_csv("Data/UTCI_daily_sites_2009_2016.csv") %>%
+  mutate(
+    date = as.Date(date),
+    # Convert Kelvin to Celsius [Turn 27]
+    across(starts_with("utci"), ~ . - 273.15) 
+  ) %>%
+  group_by(site_id) %>%
+  arrange(date) %>%
+  mutate(
+    utci_lag0 = utci_mean, # Acute day of exposure [27, Turn 24]
+    utci_lag1 = lag(utci_mean, 1),
+    utci_lag2 = lag(utci_mean, 2),
+    utci_lag3 = lag(utci_mean, 3),
+    utci_lag4 = lag(utci_mean, 4),
+    utci_lag5 = lag(utci_mean, 5),
+    utci_lag6 = lag(utci_mean, 6),
+    utci_lag7 = lag(utci_mean, 7) # Standard 7-day window [25, Turn 24]
+  ) %>%
+  ungroup()
+
+# --- PHASE 2: CLEAN INDEPTH MICRODATA ---
+# Based on Consolidated 2018 metadata [1, 4-8]
+health_data <- read_dta("Data/ConsolidatedData2018_analysis.dta") %>%
+  rename_all(str_to_lower) %>%
+  filter(residence == 1) %>% # Ensure population-at-risk [9]
+  mutate(
+    date = as.Date(eventdate),
+    year = year(date),
+    month = month(date),
+    # Unique identifier for the case-crossover match [10, Turn 18]
+    stratum_id = paste(individualid, year, month, sep = "_")
+  )
+
+# --- PHASE 3: THE STRATIFIED MERGE & TIER DEFINITION ---
+# Primary scenarios: Regional Breadth vs. Recent Warming [Turn 13, 14]
+final_analysis_matrix <- health_data %>%
+  mutate(
+    is_tier1 = if_else(year >= 2011 & year <= 2014, 1, 0),
+    is_tier2 = if_else(year >= 2009 & year <= 2015 & 
+                       str_sub(centreid, 1, 2) %in% c("GM", "CI", "SN", "BF"), 1, 0)
+  ) %>%
+  left_join(climate_master, by = c("centreid" = "site_id", "date")) %>%
+  filter(!is.na(utci_lag7)) # Drop records without full lag history [Turn 26]
+
+# --- PHASE 4: DIAGNOSTIC - ESTIMATE DISPERSION (phi) ---
+# Expert Move: Calculate phi using Efron's method and clustering [Turn 31]
+optim_data <- final_analysis_matrix %>% filter(is_tier1 == 1)
+lag_mat <- as.matrix(optim_data[, paste0("utci_lag", 0:7)])
+
+saturated_cb <- crossbasis(lag_mat, lag = 7,
+                           argvar = list(fun = "ns", df = 5),
+                           arglag = list(fun = "ns", df = 5))
+
+# Fit model to extract robust variance [Turn 31]
+saturated_fit <- clogit(outcome ~ saturated_cb + strata(stratum_id) + cluster(stratum_id), 
+                        data = optim_data, method = "efron")
+
+coef_matrix <- summary(saturated_fit)$coefficients
+phi <- mean(coef_matrix[, "robust se"]^2 / coef_matrix[, "se(coef)"]^2)
+message("Calculated Dispersion Factor (phi): ", round(phi, 3))
+
+# --- PHASE 5: QAIC OPTIMIZATION LOOP ---
+# Testing best degrees of freedom for West Africa [Turn 23, 28]
+df_grid <- expand.grid(df_var = 2:4, df_lag = 3:6)
+df_grid$QAIC <- NA
+
+for (i in 1:nrow(df_grid)) {
+  cb_loop <- crossbasis(lag_mat, lag = 7,
+                        argvar = list(fun = "ns", df = df_grid$df_var[i]),
+                        arglag = list(fun = "ns", df = df_grid$df_lag[i]))
+  
+  fit_loop <- clogit(outcome ~ cb_loop + strata(stratum_id), data = optim_data, method = "efron")
+  
+  # Manual QAIC calculation [Turn 23]
+  df_grid$QAIC[i] <- (-2 * fit_loop$loglik[10] / phi) + (2 * (df_grid$df_var[i] * df_grid$df_lag[i]))
+}
+
+best_params <- df_grid[which.min(df_grid$QAIC), ]
+print(best_params)
+
+# --- PHASE 6: MAIN ANALYSIS & MMT IDENTIFICATION ---
+# Final regional curve for West Africa [Roadmap, Turn 16]
+cb_final <- crossbasis(lag_mat, lag = 7,
+                       argvar = list(fun = "ns", df = best_params$df_var),
+                       arglag = list(fun = "ns", df = best_params$df_lag))
+
+fit_final <- clogit(outcome ~ cb_final + strata(stratum_id), data = optim_data, method = "efron")
+
+# Identify MMT (Minimum Mortality Temperature) [102, Turn 16]
+pred_all <- crosspred(cb_final, fit_final, by = 0.1)
+MMT <- pred_all$predvar[which.min(pred_all$allRRfit)]
+message("Regional Minimum Mortality Temperature: ", MMT, "°C UTCI")
+
+# --- PHASE 7: VISUALIZATION ---
+# Centered 3D plot and 99th percentile slices [Source 25, Turn 29]
+plot(crosspred(cb_final, fit_final, cen = MMT), 
+     xlab = "UTCI (°C)", ylab = "Lag (days)", 
+     main = "Heat-Mortality Risk in West Africa (2011-2014)")
+
+# --- PHASE 8: BASELINE SITE SUMMARY ---
+baseline_tbl <- optim_data %>%
+  filter(outcome == 1) %>% # Summary of Cases only [Turn 18]
+  mutate(sex = factor(sex, levels = c(1, 2), labels = c("Male", "Female"))) %>%
+  select(centreid, sex, age_group, utci_mean) %>%
+  tbl_summary(by = centreid, 
+              label = list(utci_mean ~ "Mean Daily UTCI")) %>%
+  add_overall() %>% bold_labels() %>% as_flex_table()
+
+baseline_tbl
+```
+

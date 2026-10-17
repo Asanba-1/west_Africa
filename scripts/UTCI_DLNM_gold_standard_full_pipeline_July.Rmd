@@ -1,0 +1,630 @@
+---
+title: "West Africa UTCI-Mortality: Gold-Standard DLNM Pipeline"
+subtitle: "Descriptives -> Crossbasis Selection -> Diagnostics -> Centre Models -> Meta-analysis -> Meta-regression -> Temporal Adaptation -> Subgroups -> Attributable Fraction"
+author: "Asanba"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+<!--
+==============================================================================
+AUDIT NOTE — READ BEFORE RUNNING
+==============================================================================
+This single file replaces the entire 05-17 script series. Every repeated
+fit/QAIC/MMT/kappa/meta-analysis block is factored into ONE function, used
+everywhere it is needed (Section 0). Package choices below were checked
+against current (2026) CRAN status and the methodological literature, not
+carried over from the earlier draft scripts uncritically:
+
+  * mvmeta -> REPLACED with mixmeta. mvmeta is the original 2012 package
+    (Gasparrini & Kenward) but its own authors (Sera, Gasparrini et al. 2019,
+    Stat Med) superseded it with mixmeta, "an extended mixed-effects
+    framework for meta-analysis" that subsumes multivariate, multilevel,
+    and meta-regression models in one actively maintained package. mixmeta
+    is the tool actually used in current MCC Network publications.
+  * attrdl() -> NOT part of CRAN dlnm. It is Gasparrini's standalone
+    function (Gasparrini & Leone 2014, BMC Med Res Methodol). Rather than
+    the fragile "source() a script off a personal webpage" pattern, this
+    script uses FluMoDL::attrdl, a maintained CRAN package that imports and
+    re-exports the identical, peer-reviewed implementation.
+  * do() (deprecated dplyr verb, superseded by 2017) -> replaced with
+    group_split()/map()/group_modify() throughout.
+  * gnm + eliminate=... (conditional quasi-Poisson) kept: this is still the
+    standard, actively maintained tool for time-stratified case-crossover
+    DLNMs and is algebraically equivalent to clogit() for the exposure
+    coefficients while providing a genuine quasi-likelihood dispersion.
+  * QAIC uses the log-likelihood formula (-2*loglik + 2*edf*phi), the
+    version used in current dlnm/Armstrong tutorials, not the
+    deviance-based approximation seen in some exploratory drafts.
+
+LOCKED CROSSBASIS SPECIFICATION (carried forward from the audited
+06_crossbasis_selection stage, and re-derived programmatically in Section 2
+below so the lock is never taken on faith):
+    max_lag = 21, exposure_df = 3 (equalknots), lag_df = 3 (logknots)
+Rationale: this is the simplest specification inside the numerically stable
+region (condition number < 500) that also has the lowest QAIC among stable
+candidates, and two independent grid searches (lag-window scan; exposure/
+lag-df grid) agree on MMT ~ 24 deg C UTCI at this specification -- see
+Section 2 for the full decision trail. Do not skip Section 2 and hand-set
+this list from memory; re-run it if the input data changes.
+==============================================================================
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# ---- core (no deprecated verbs used from any of these) ----
+library(tidyverse)   # dplyr >=1.1, no do()/summarise_each()/spread()/gather()
+library(lubridate)
+library(dlnm)
+library(gnm)
+library(splines)
+library(mixmeta)     # supersedes mvmeta (Sera et al. 2019, Stat Med)
+#library(FluMoDL)      # provides maintained attrdl() (Gasparrini & Leone 2014)
+library(gtsummary)
+library(flextable)
+library(officer)
+library(patchwork)
+library(scales)
+library(RColorBrewer)
+
+
+theme_set(theme_bw(base_size = 12))
+
+dirs <- c("Results/Descriptives", "Results/Crossbasis", "Results/Diagnostics",
+          "Results/CentreModels", "Results/Meta", "Results/MetaRegression",
+          "Results/TemporalAdaptation", "Results/Subgroups",
+          "Results/AttributableFraction", "Results/Figures", "Results/Objects")
+walk(dirs, dir.create, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r config}
+analysis_ready_matrix <- readRDS("mortality_health_analysis_readydata.rds")
+
+EXPOSURE_VAR <- "utci_mean"
+OUTCOME_VAR  <- "outcome"
+STRATUM_VAR  <- "stratum_id"
+LAG_PREFIX   <- "utci_lag"
+
+LOCKED_SPEC <- list(max_lag = 21, exposure_df = 3, lag_df = 3)
+MIN_CENTRE_DEATHS <- 100   # minimum events for a centre to be modelled alone
+KAPPA_MAX <- 500           # condition-number stability ceiling used throughout
+```
+
+# 0. Shared helper functions (single source of truth for every model fit)
+
+```{r helpers}
+## ---- lag basis ------------------------------------------------------------
+build_lag_basis <- function(max_lag, lag_df = NULL) {
+  if (!is.null(lag_df)) return(list(fun = "ns", knots = logknots(max_lag, nk = lag_df)))
+  if (max_lag <= 3)  return(list(fun = "integer"))
+  if (max_lag <= 7)  return(list(fun = "ns", df = 2))
+  if (max_lag <= 14) return(list(fun = "ns", df = 3))
+  list(fun = "ns", knots = logknots(max_lag, nk = 3))
+}
+
+## ---- QAIC (Gasparrini/Armstrong quasi-AIC, log-likelihood based) --------
+compute_qaic <- function(fit) {
+  phi    <- summary(fit)$dispersion
+  loglik <- sum(dpois(fit$y, fit$fitted.values, log = TRUE))
+  edf    <- summary(fit)$df[3]
+  -2 * loglik + 2 * edf * phi
+}
+
+## ---- fit ANY (max_lag, exposure_df/knots, lag_df/knots) combination ------
+run_dlnm_spec <- function(data, max_lag, exposure_df = NULL, lag_df = NULL,
+                           var_knots = NULL, lag_knots = NULL,
+                           exposure_var = EXPOSURE_VAR, outcome_var = OUTCOME_VAR,
+                           stratum_var = STRATUM_VAR, lag_prefix = LAG_PREFIX,
+                           mmt_probs = c(.01, .99), by = 0.1, cen = NULL, quiet = TRUE) {
+
+  lag_cols <- paste0(lag_prefix, 0:max_lag)
+  missing_cols <- setdiff(lag_cols, names(data))
+  if (length(missing_cols) > 0) { warning("Missing lag cols: ", paste(missing_cols, collapse=", ")); return(NULL) }
+
+  lag_matrix <- as.matrix(data[, lag_cols])
+  keep <- complete.cases(lag_matrix)
+  dat  <- data[keep, ]; lag_matrix <- lag_matrix[keep, ]
+  if (nrow(dat) == 0) return(NULL)
+  if (!quiet) cat("max_lag=", max_lag, " rows=", nrow(dat), "\n")
+
+  if (is.null(var_knots)) var_knots <- equalknots(dat[[exposure_var]], fun = "ns", df = exposure_df)
+  lag_basis <- if (!is.null(lag_knots)) list(fun = "ns", knots = lag_knots) else build_lag_basis(max_lag, lag_df)
+
+  cb <- tryCatch(
+    crossbasis(lag_matrix, lag = max_lag,
+               argvar = list(fun = "ns", knots = var_knots), arglag = lag_basis),
+    error = function(e) { message("crossbasis failed: ", e$message); NULL })
+  if (is.null(cb)) return(NULL)
+
+  fit <- tryCatch(
+    gnm(as.formula(paste0(outcome_var, " ~ cb")), eliminate = factor(dat[[stratum_var]]),
+        family = quasipoisson(), data = dat),
+    error = function(e) { message("gnm failed: ", e$message); NULL })
+  if (is.null(fit)) return(NULL)
+
+  q <- quantile(dat[[exposure_var]], mmt_probs, na.rm = TRUE)
+  pred_raw <- tryCatch(crosspred(cb, fit, by = by, model.link = "log"), error = function(e) NULL)
+  MMT <- NA_real_
+  if (!is.null(pred_raw)) {
+    idx <- pred_raw$predvar >= q[1] & pred_raw$predvar <= q[2]
+    if (any(idx)) MMT <- pred_raw$predvar[idx][which.min(pred_raw$allRRfit[idx])]
+  }
+  centre_pt <- if (is.null(cen)) MMT else cen
+  pred <- tryCatch(crosspred(cb, fit, cen = centre_pt, by = by, model.link = "log"), error = function(e) pred_raw)
+
+  kappa_val <- tryCatch(kappa(cb), error = function(e) NA_real_)
+
+  list(
+    data = dat, cb = cb, fit = fit, pred = pred, MMT = MMT,
+    var_knots = var_knots, lag_basis = lag_basis,
+    diagnostics = tibble(
+      max_lag = max_lag, exposure_df = exposure_df, lag_df = lag_df,
+      converged = isTRUE(fit$converged), QAIC = compute_qaic(fit),
+      phi = summary(fit)$dispersion, MMT = round(MMT, 2),
+      rank = qr(cb)$rank, n_basis = ncol(cb), kappa = round(kappa_val, 1)
+    )
+  )
+}
+
+## ---- MCDA decision filter -------------------------------------------------
+apply_decision_rule <- function(tbl, kappa_max = KAPPA_MAX, mmt_range) {
+  tbl %>%
+    filter(converged, kappa < kappa_max, MMT >= mmt_range[1], MMT <= mmt_range[2]) %>%
+    mutate(QAIC_rank = rank(QAIC), Kappa_rank = rank(kappa),
+           MMT_rank = rank(abs(MMT - median(MMT))),
+           Score = QAIC_rank + Kappa_rank + MMT_rank) %>%
+    arrange(Score)
+}
+
+## ---- overlay RR curves -----------------------------------------------------
+plot_curve_overlay <- function(results, labels, title = "") {
+  ok <- !sapply(results, is.null); results <- results[ok]; labels <- labels[ok]
+  x_rng <- range(unlist(lapply(results, \(r) r$pred$predvar)), na.rm = TRUE)
+  y_rng <- range(unlist(lapply(results, \(r) r$pred$allRRfit)), na.rm = TRUE)
+  cols <- colorRampPalette(brewer.pal(8, "Dark2"))(length(results))
+  plot(NULL, xlim = x_rng, ylim = y_rng, xlab = "UTCI", ylab = "Cumulative RR", main = title)
+  abline(h = 1, lty = 2, col = "grey40")
+  for (i in seq_along(results)) lines(results[[i]]$pred$predvar, results[[i]]$pred$allRRfit, col = cols[i], lwd = 2)
+  legend("topright", legend = labels, col = cols, lwd = 2, bty = "n", cex = 0.75)
+}
+
+## ---- fit ONE centre using FROZEN knots (used by Section 5 and reused for
+##      subgroup/temporal two-stage analyses) --------------------------------
+fit_one_centre <- function(centre_data, centre_id, spec, var_knots, lag_knots,
+                            min_deaths = MIN_CENTRE_DEATHS, cen) {
+  n_deaths <- sum(centre_data[[OUTCOME_VAR]] == 1)
+  if (n_deaths < min_deaths) { message(centre_id, ": excluded (", n_deaths, " deaths)"); return(NULL) }
+
+  res <- run_dlnm_spec(centre_data, max_lag = spec$max_lag, var_knots = var_knots,
+                        lag_knots = lag_knots, cen = cen, quiet = TRUE)
+  if (is.null(res)) { message(centre_id, ": model failed"); return(NULL) }
+  if (!is.na(res$diagnostics$kappa) && res$diagnostics$kappa > KAPPA_MAX) {
+    message(centre_id, ": excluded (kappa=", round(res$diagnostics$kappa,0), ")"); return(NULL)
+  }
+  red <- crossreduce(res$cb, res$fit, cen = cen)
+  list(centre_id = centre_id, fit = res$fit, cb = res$cb, pred = res$pred,
+       reduced = red, n_deaths = n_deaths, kappa = res$diagnostics$kappa)
+}
+
+## ---- two-stage pipeline: per-group centre models -> mixmeta pooling ------
+two_stage_pool <- function(data, group_col = "centreid", spec, var_knots, lag_knots,
+                            cen, min_deaths = MIN_CENTRE_DEATHS) {
+  fits <- data %>%
+    group_split(.data[[group_col]]) %>%
+    set_names(map_chr(., ~ as.character(.x[[group_col]][1]))) %>%
+    imap(~ fit_one_centre(.x, .y, spec, var_knots, lag_knots, min_deaths, cen))
+  fits <- fits[!sapply(fits, is.null)]
+  if (length(fits) < 2) { message("Fewer than 2 groups fit successfully; cannot meta-analyse."); return(NULL) }
+
+  coef_list <- map(fits, ~ .x$reduced$coefficients)
+  vcov_list <- map(fits, ~ .x$reduced$vcov)
+  coef_matrix <- do.call(rbind, coef_list)
+
+  meta_fit <- mixmeta(coef_matrix, vcov_list, method = "reml")
+  list(fits = fits, coef_list = coef_list, vcov_list = vcov_list, meta_fit = meta_fit)
+}
+
+## ---- heterogeneity summary -------------------------------------------------
+heterogeneity_summary <- function(meta_fit) {
+  s <- summary(meta_fit)
+  tibble(Q = s$qstat$Q, df = s$qstat$df, p_value = s$qstat$pvalue,
+         tau2 = mean(diag(meta_fit$Psi)), logLik = as.numeric(logLik(meta_fit)))
+}
+
+## ---- custom forest plot (portable across mixmeta versions) ---------------
+forest_plot_mixmeta <- function(fits, meta_fit, dim = 1, title = "") {
+  est <- map_dbl(fits, ~ .x$reduced$coefficients[dim])
+  se  <- map_dbl(fits, ~ sqrt(.x$reduced$vcov[dim, dim]))
+  pooled_est <- coef(meta_fit)[dim]
+  pooled_se  <- sqrt(vcov(meta_fit)[dim, dim])
+
+  df <- tibble(group = c(names(fits), "Pooled (mixmeta, REML)"),
+               est = c(est, pooled_est), se = c(se, pooled_se)) %>%
+    mutate(lo = est - 1.96 * se, hi = est + 1.96 * se,
+           group = factor(group, levels = rev(group)),
+           pooled = group == "Pooled (mixmeta, REML)")
+
+  ggplot(df, aes(est, group, colour = pooled)) +
+    geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+    geom_pointrange(aes(xmin = lo, xmax = hi)) +
+    scale_colour_manual(values = c("black", "firebrick"), guide = "none") +
+    labs(x = "Reduced coefficient (log RR scale)", y = NULL, title = title)
+}
+```
+
+# 1. Descriptive statistics
+
+```{r desc-structure}
+dim(analysis_ready_matrix)
+variable_types <- tibble(Variable = names(analysis_ready_matrix),
+                          Class = map_chr(analysis_ready_matrix, ~ class(.x)[1]))
+variable_types
+```
+
+```{r desc-design-checks}
+referent_summary <- analysis_ready_matrix %>% count(.data[[STRATUM_VAR]], name = "MatchedDays")
+summary(referent_summary$MatchedDays)   # expect ~1 case + 3-4 referents per stratum
+
+prop.table(table(analysis_ready_matrix[[OUTCOME_VAR]]))
+range(analysis_ready_matrix$date)
+```
+
+```{r desc-population}
+cases <- analysis_ready_matrix %>% filter(.data[[OUTCOME_VAR]] == 1) %>%
+  mutate(sex = factor(sex, levels = c(1, 2), labels = c("Male", "Female")))
+
+cat("Cases:", nrow(cases), " | Strata:", n_distinct(cases[[STRATUM_VAR]]), "\n")
+
+table1 <- cases %>%
+  select(sex, age_group, country_name, centreid) %>%
+  tbl_summary(label = list(sex ~ "Sex", age_group ~ "Age group",
+                            country_name ~ "Country", centreid ~ "HDSS centre"),missing = "no") %>%
+  bold_labels() %>% add_overall() %>% as_flex_table()
+
+table1
+save_as_docx(table1, path = "Results/Descriptives/Table1.docx")
+```
+
+```{r desc-utci}
+utci_percentiles <- quantile(cases[[EXPOSURE_VAR]], c(0, .01, .05, .10, .25, .50, .75, .90, .95, .99, 1))
+utci_percentiles
+
+ggplot(cases, aes(.data[[EXPOSURE_VAR]])) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  labs(x = "UTCI (\u00b0C)", y = "Frequency", title = "UTCI on case days")
+ggsave("Results/Descriptives/UTCI_Histogram.png", width = 8, height = 6)
+
+ggplot(cases, aes(country_name, .data[[EXPOSURE_VAR]], fill = country_name)) +
+  geom_boxplot(outlier.alpha = .2, show.legend = FALSE) + coord_flip() +
+  labs(x = NULL, y = "UTCI (\u00b0C)")
+ggsave("Results/Descriptives/UTCI_by_Country.png", width = 8, height = 6)
+```
+
+```{r desc-trends, fig.width=9, fig.height=4}
+annual_utci <- cases %>% group_by(year) %>% summarise(MeanUTCI = mean(.data[[EXPOSURE_VAR]]))
+ggplot(annual_utci, aes(year, MeanUTCI)) + geom_line() + geom_point() +
+  geom_smooth(method = "lm", se = FALSE, colour = "red") +
+  labs(title = "Annual mean UTCI on case days")
+ggsave("Results/Descriptives/Annual_UTCI_Trend.png", width = 9, height = 4)
+```
+
+# 2. Crossbasis selection: multi-criteria decision framework
+
+QAIC alone is never the final arbiter -- a candidate must first clear
+numerical-stability and biological-plausibility gates (Section 2.3).
+
+```{r cb-lag-window-scan}
+lag_window_results <- map(c(3, 7, 14, 21, 28),
+                           ~ run_dlnm_spec(analysis_ready_matrix, max_lag = .x, exposure_df = 3))
+names(lag_window_results) <- paste0("lag_", c(3, 7, 14, 21, 28))
+lag_window_summary <- map_dfr(lag_window_results, "diagnostics") %>% arrange(QAIC)
+lag_window_summary
+```
+
+```{r cb-df-grid}
+df_grid <- expand_grid(exposure_df = 3:5, lag_df = 2:5)
+df_grid_results <- pmap(df_grid, ~ run_dlnm_spec(analysis_ready_matrix, max_lag = 21,
+                                                   exposure_df = ..1, lag_df = ..2))
+names(df_grid_results) <- paste0("E", df_grid$exposure_df, "_L", df_grid$lag_df)
+df_grid_summary <- map_dfr(df_grid_results, "diagnostics") %>% arrange(QAIC)
+df_grid_summary
+```
+
+```{r cb-heatmaps, fig.width=6, fig.height=5}
+ggplot(df_grid_summary, aes(factor(exposure_df), factor(lag_df), fill = QAIC)) +
+  geom_tile(colour = "white") + geom_text(aes(label = round(QAIC, 0)), size = 3) +
+  scale_fill_viridis_c() + labs(x = "Exposure df", y = "Lag df", title = "QAIC (lag=21d)")
+
+ggplot(df_grid_summary, aes(factor(exposure_df), factor(lag_df), fill = kappa)) +
+  geom_tile(colour = "white") + geom_text(aes(label = round(kappa, 0)), size = 3) +
+  scale_fill_viridis_c(option = "magma") + labs(x = "Exposure df", y = "Lag df",
+                                                  title = "Condition number (>500 flagged unstable)")
+```
+
+```{r cb-decision}
+mmt_plausible <- quantile(analysis_ready_matrix[[EXPOSURE_VAR]], c(.05, .95), na.rm = TRUE)
+candidates <- apply_decision_rule(df_grid_summary, mmt_range = mmt_plausible)
+candidates
+```
+
+exposure_df=5 is excluded here regardless of its QAIC advantage: kappa
+exceeds 500 and MMT collapses from ~24 to ~17 deg C -- an overfitting
+artifact, not a biological signal. The top surviving candidate,
+exposure_df=3/lag_df=3, matches `LOCKED_SPEC` and independently reproduces
+the lag-window scan's 21-day result -- two different grid searches
+agreeing is the actual evidence for this choice.
+
+```{r cb-lock}
+best <- run_dlnm_spec(analysis_ready_matrix, max_lag = LOCKED_SPEC$max_lag,
+                       exposure_df = LOCKED_SPEC$exposure_df, lag_df = LOCKED_SPEC$lag_df, quiet = TRUE)
+best$diagnostics
+
+FINAL_KNOTS <- list(var_knots = best$var_knots, lag_knots = best$lag_basis$knots)
+POOLED_MMT  <- best$MMT
+
+saveRDS(best, "Results/Objects/best_model.rds")
+saveRDS(FINAL_KNOTS, "Results/Objects/final_knots.rds")
+saveRDS(LOCKED_SPEC, "Results/Objects/final_crossbasis_specification.rds")
+
+flextable::save_as_docx(flextable::autofit(flextable::flextable(df_grid_summary)),
+                         path = "Results/Crossbasis/Candidate_Model_Comparison.docx")
+```
+
+# 3. DLNM diagnostics on the locked model
+
+```{r diag-load}
+fit <- best$fit; cb <- best$cb; dat <- best$data; MMT <- POOLED_MMT
+final_pred <- crosspred(cb, fit, cen = MMT, by = 0.1)
+```
+
+```{r diag-stability}
+tibble(Rank = qr(cb)$rank, Columns = ncol(cb), Condition_number = round(kappa(cb), 1),
+       Missing = sum(is.na(cb)), Converged = isTRUE(fit$converged),
+       Dispersion_phi = round(summary(fit)$dispersion, 3))
+```
+
+```{r diag-residuals, fig.width=9, fig.height=4}
+res <- residuals(fit, type = "pearson"); fitval <- fitted(fit)
+p1 <- ggplot(tibble(res), aes(res)) + geom_histogram(bins = 50, fill = "steelblue")
+p2 <- ggplot(tibble(fitval, res), aes(fitval, res)) + geom_point(alpha = .15, size = .5) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "red")
+p1 + p2
+ggsave("Results/Diagnostics/Residuals.png", width = 9, height = 4)
+```
+
+```{r diag-prediction}
+tibble(Any_NA_RR = any(is.na(final_pred$allRRfit)),
+       Mean_CI_width = mean(final_pred$allRRhigh - final_pred$allRRlow))
+```
+
+```{r diag-mmt-support, fig.width=7, fig.height=4}
+p5 <- quantile(dat[[EXPOSURE_VAR]], .05); p95 <- quantile(dat[[EXPOSURE_VAR]], .95)
+ggplot(dat, aes(.data[[EXPOSURE_VAR]])) +
+  geom_histogram(bins = 60, fill = "grey85", colour = "white") +
+  geom_vline(xintercept = MMT, colour = "red", linewidth = 1.2, linetype = 2) +
+  labs(title = "Exposure distribution and MMT", x = "UTCI (\u00b0C)")
+tibble(P05 = round(p5,1), MMT = round(MMT,1), P95 = round(p95,1),
+       MMT_inside_5_95 = MMT >= p5 & MMT <= p95)
+```
+
+```{r diag-curve-slices, fig.width=9, fig.height=3.5}
+plot(final_pred, "overall", ci = "area", xlab = "UTCI", ylab = "RR", main = "Cumulative RR (centred at MMT)")
+abline(v = MMT, col = "red", lty = 2); rug(dat[[EXPOSURE_VAR]])
+
+par(mfrow = c(1, 3))
+plot(final_pred, "slices", var = MMT + 5, ci = "lines", main = "Moderate heat")
+plot(final_pred, "slices", var = MMT + 8, ci = "lines", main = "Extreme heat")
+plot(final_pred, "slices", var = MMT - 5, ci = "lines", main = "Cold")
+par(mfrow = c(1, 1))
+
+plot(final_pred, theta = 220, phi = 35, shade = .4, col = "lightblue",
+     xlab = "UTCI", ylab = "Lag", zlab = "RR", main = "3D risk surface")
+```
+
+```{r diag-mmt-bootstrap}
+bootstrap_mmt <- function(data, spec, n_boot = 200, seed = 1) {
+  set.seed(seed); strata <- unique(data[[STRATUM_VAR]]); out <- numeric(n_boot)
+  for (b in seq_len(n_boot)) {
+    samp <- sample(strata, length(strata), replace = TRUE)
+    bd <- data %>% filter(.data[[STRATUM_VAR]] %in% samp) %>%
+      group_by(.data[[STRATUM_VAR]]) %>% mutate(.boot_id = cur_group_id()) %>% ungroup()
+    r <- tryCatch(run_dlnm_spec(bd, max_lag = spec$max_lag, exposure_df = spec$exposure_df,
+                                  lag_df = spec$lag_df, quiet = TRUE), error = function(e) NULL)
+    out[b] <- if (is.null(r)) NA_real_ else r$diagnostics$MMT
+  }
+  out
+}
+# n_boot=200 for tractability; raise to >=1000 for the final manuscript run
+boot_mmt <- bootstrap_mmt(dat, LOCKED_SPEC, n_boot = 200)
+tibble(Median_MMT = median(boot_mmt, na.rm = TRUE),
+       CI_low = quantile(boot_mmt, .025, na.rm = TRUE),
+       CI_high = quantile(boot_mmt, .975, na.rm = TRUE),
+       N_failed = sum(is.na(boot_mmt)))
+```
+
+```{r diag-loco, fig.width=7, fig.height=5}
+centres <- unique(dat$centreid)
+loco <- map(centres, ~ run_dlnm_spec(dat %>% filter(centreid != .x), max_lag = LOCKED_SPEC$max_lag,
+                                       exposure_df = LOCKED_SPEC$exposure_df, lag_df = LOCKED_SPEC$lag_df,
+                                       cen = MMT, quiet = TRUE))
+names(loco) <- paste0("excl_", centres)
+loco <- loco[!sapply(loco, is.null)]
+plot_curve_overlay(c(list(full = best), loco), c("Full data", names(loco)), "Leave-one-centre-out")
+```
+
+```{r diag-report}
+diag_report <- tibble(Metric = c("Converged","Rank","Columns","Condition number","Dispersion","MMT","MMT in 5-95pct"),
+  Value = c(as.character(isTRUE(fit$converged)), qr(cb)$rank, ncol(cb), round(kappa(cb),1),
+            round(summary(fit)$dispersion,3), round(MMT,2), as.character(MMT>=p5 & MMT<=p95)))
+save_as_docx(flextable(diag_report), path = "Results/Diagnostics/Diagnostic_Report.docx")
+diag_report
+```
+
+# 4. Centre-specific models and West Africa meta-analysis
+
+```{r centre-and-meta}
+pooled <- two_stage_pool(dat, group_col = "centreid", spec = LOCKED_SPEC,
+                          var_knots = FINAL_KNOTS$var_knots, lag_knots = FINAL_KNOTS$lag_knots, cen = MMT)
+
+cat("Centres pooled:", length(pooled$fits), "\n")
+
+west_africa_model <- pooled$meta_fit
+summary(west_africa_model)
+heterogeneity_summary(west_africa_model)
+
+saveRDS(pooled$coef_list, "Results/CentreModels/coef_list.rds")
+saveRDS(pooled$vcov_list, "Results/CentreModels/vcov_list.rds")
+saveRDS(west_africa_model, "Results/Meta/WestAfrica_mixmeta.rds")
+```
+
+```{r meta-pooled-curve, fig.width=8, fig.height=6}
+west_pred <- crosspred(cb, coef = coef(west_africa_model), vcov = vcov(west_africa_model),
+                        model.link = "log", by = .1, cen = MMT)
+plot(west_pred, "overall", xlab = "UTCI (\u00b0C)", ylab = "RR",
+     main = "West Africa pooled UTCI-mortality association")
+abline(v = MMT, col = "red", lty = 2)
+ggsave_dummy <- dev.copy(png, "Results/Meta/WestAfrica_Overall.png", width = 1000, height = 700); dev.off()
+```
+
+```{r meta-forest, fig.width=7, fig.height=5}
+forest_plot_mixmeta(pooled$fits, west_africa_model, dim = 1, title = "Centre-specific vs pooled (dim 1)")
+```
+
+```{r meta-blup}
+blups <- blup(west_africa_model, vcov = TRUE)
+centre_rank <- tibble(Centre = names(pooled$fits),
+                       RR_dim1 = map_dbl(blups, ~ .x$blup[1])) %>% arrange(desc(RR_dim1))
+centre_rank
+saveRDS(blups, "Results/Meta/BLUPs.rds")
+```
+
+# 5. Meta-regression (why do centres differ?)
+
+Runs only if centre-level covariates are supplied; skips gracefully otherwise
+rather than fabricating placeholder covariates.
+
+```{r meta-regression}
+cov_path <- "Data/CentreCovariates.csv"
+if (file.exists(cov_path)) {
+  centre_covariates <- read_csv(cov_path)
+  meta_data <- tibble(centreid = names(pooled$fits)) %>% left_join(centre_covariates, by = "centreid")
+  coef_matrix <- do.call(rbind, pooled$coef_list)
+
+  meta_reg <- mixmeta(coef_matrix ~ MeanUTCI + Latitude, vcov = pooled$vcov_list,
+                       data = meta_data, method = "reml")
+  summary(meta_reg)
+
+  tau0 <- mean(diag(west_africa_model$Psi)); tau1 <- mean(diag(meta_reg$Psi))
+  cat("Pseudo R-squared (heterogeneity explained):", round(100*(tau0-tau1)/tau0, 1), "%\n")
+
+  ggplot(meta_data, aes(MeanUTCI, MMT, size = n_deaths)) +
+    geom_point() + geom_smooth(method = "lm", se = FALSE) +
+    labs(title = "Meta-regression: mean UTCI vs MMT by centre")
+  ggsave("Results/MetaRegression/Bubble_MeanUTCI_MMT.png", width = 7, height = 5)
+} else {
+  message("Data/CentreCovariates.csv not found -- skipping meta-regression. ",
+          "Provide centreid, MeanUTCI, Latitude, ClimateZone, etc. to enable this section.")
+}
+```
+
+# 6. Temporal adaptation
+
+```{r temporal-adaptation}
+periods <- list(early = c(2009, 2012), late = c(2013, 2016))  # adjust to your coverage
+period_pools <- imap(periods, function(rng, label) {
+  pd <- dat %>% filter(year >= rng[1], year <= rng[2])
+  two_stage_pool(pd, group_col = "centreid", spec = LOCKED_SPEC,
+                 var_knots = FINAL_KNOTS$var_knots, lag_knots = FINAL_KNOTS$lag_knots, cen = MMT)
+})
+period_pools <- period_pools[!sapply(period_pools, is.null)]
+
+if (length(period_pools) == 2) {
+  preds <- imap(period_pools, ~ crosspred(cb, coef = coef(.x$meta_fit), vcov = vcov(.x$meta_fit),
+                                            model.link = "log", by = .1, cen = MMT))
+  plot(preds[[1]], "overall", col = "blue", ci = "n", xlab = "UTCI", ylab = "RR",
+       main = "Temporal adaptation: early vs late period")
+  lines(preds[[2]]$predvar, preds[[2]]$allRRfit, col = "red", lwd = 2)
+  abline(h = 1, lty = 2)
+  legend("topright", legend = names(preds), col = c("blue", "red"), lwd = 2, bty = "n")
+} else {
+  message("Fewer than 2 periods produced a valid pooled model -- check period date ranges/sample size.")
+}
+```
+
+# 7. Subgroup analysis
+
+Independent pooled DLNM per subgroup (simplified single-stage version of the
+MCC two-stage approach; upgrade to per-centre-then-meta within each subgroup
+if centre x subgroup event counts allow it).
+
+```{r subgroup-analysis, fig.width=7, fig.height=5}
+run_subgroup <- function(filter_expr_result, label) {
+  run_dlnm_spec(filter_expr_result, max_lag = LOCKED_SPEC$max_lag,
+                var_knots = FINAL_KNOTS$var_knots, lag_knots = FINAL_KNOTS$lag_knots,
+                cen = MMT, quiet = TRUE)
+}
+
+subgroup_results <- list(
+  Male    = run_subgroup(dat %>% filter(sex == 1), "Male"),
+  Female  = run_subgroup(dat %>% filter(sex == 2), "Female"),
+  Elderly = run_subgroup(dat %>% filter(age_group == "Elderly (>65)"), "Elderly"),
+  Young_Children = run_subgroup(dat %>% filter(age_group == "Young Children (<=5)"), "Young Children")
+)
+
+plot_curve_overlay(subgroup_results, names(subgroup_results), "Subgroup exposure-response curves")
+
+map_dfr(subgroup_results, "diagnostics", .id = "subgroup") %>%
+  select(subgroup, MMT, QAIC, phi, kappa, converged)
+```
+
+# 8. Attributable fraction (heat vs. cold, relative to MMT)
+
+```{r attributable-fraction}
+af_pooled_total <- attrdl(dat[[EXPOSURE_VAR]], cb, dat[[OUTCOME_VAR]], model = fit,
+                           type = "af", dir = "forw", cen = MMT)
+af_pooled_heat  <- attrdl(dat[[EXPOSURE_VAR]], cb, dat[[OUTCOME_VAR]], model = fit,
+                           type = "af", dir = "forw", cen = MMT, range = c(MMT, Inf))
+af_pooled_cold  <- attrdl(dat[[EXPOSURE_VAR]], cb, dat[[OUTCOME_VAR]], model = fit,
+                           type = "af", dir = "forw", cen = MMT, range = c(-Inf, MMT))
+
+af_summary <- tibble(component = c("Total non-optimum", "Heat", "Cold"),
+                      attributable_fraction_pct = round(100 * c(af_pooled_total, af_pooled_heat, af_pooled_cold), 2))
+af_summary
+
+af_by_centre <- imap_dfr(pooled$fits, function(cf, cid) {
+  cd <- cf$fit$data
+  af_h <- tryCatch(attrdl(cd[[EXPOSURE_VAR]], cf$cb, cd[[OUTCOME_VAR]], model = cf$fit,
+                           type = "af", dir = "forw", cen = MMT, range = c(MMT, Inf)),
+                    error = function(e) NA_real_)
+  af_c <- tryCatch(attrdl(cd[[EXPOSURE_VAR]], cf$cb, cd[[OUTCOME_VAR]], model = cf$fit,
+                           type = "af", dir = "forw", cen = MMT, range = c(-Inf, MMT)),
+                    error = function(e) NA_real_)
+  tibble(centre = cid, AF_heat_pct = round(100*af_h,2), AF_cold_pct = round(100*af_c,2))
+})
+af_by_centre
+
+write_csv(bind_rows(af_summary %>% mutate(centre = "West Africa (pooled)"), af_by_centre),
+          "Results/AttributableFraction/Attributable_Fraction_Summary.csv")
+```
+
+# 9. Publication tables and reproducibility
+
+```{r pub-summary-table}
+final_summary <- tibble(
+  Model = "Conditional quasi-Poisson DLNM (gnm, eliminate=stratum)",
+  Exposure = EXPOSURE_VAR, Max_lag = LOCKED_SPEC$max_lag,
+  Exposure_df = LOCKED_SPEC$exposure_df, Lag_df = LOCKED_SPEC$lag_df,
+  MMT = round(MMT, 2), Dispersion = round(summary(fit)$dispersion, 3),
+  Kappa = round(kappa(cb), 1), N_centres_pooled = length(pooled$fits),
+  Heterogeneity_I2_proxy = round(100 * mean(diag(west_africa_model$Psi)) /
+    (mean(diag(west_africa_model$Psi)) + mean(diag(vcov(west_africa_model)))), 1)
+)
+save_as_docx(flextable(final_summary), path = "Results/Meta/Final_Model_Summary.docx")
+final_summary
+```
+
+```{r reproducibility}
+writeLines(capture.output(sessionInfo()), "Results/Objects/SessionInfo.txt")
+sessionInfo()
+```

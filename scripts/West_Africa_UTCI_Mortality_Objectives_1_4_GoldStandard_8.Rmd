@@ -1,0 +1,1896 @@
+---
+title: "West Africa UTCI-Mortality: Gold-Standard DLNM Analysis"
+subtitle: "Objectives 1–4 with memory-safe uncertainty estimation"
+author: "Reproducible analysis pipeline"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  word_document:
+    toc: true
+params:
+  analysis_object: "analysis_ready_matrix"
+  max_lag_primary: 21
+  candidate_lags: [7, 14, 21]
+  exposure_df_candidates: [3, 4, 5]
+  lag_df_candidates: [3, 4]
+  mmt_search_low: 0.05
+  mmt_search_high: 0.95
+  mmt_min_plausible: 25
+  max_rr_plausible: 2
+  kappa_max: 500
+  dispersion_max: 2
+  qaic_tolerance: 2
+  min_centre_deaths: 50
+  mc_draws: 10000
+  seed: 20260901
+---
+
+# 1. Analysis plan
+
+This document executes the four protocol objectives sequentially:
+
+1. **Exposure–response:** estimate the UTCI–all-cause mortality exposure–response relationship using a time-stratified case-crossover design and DLNM.
+2. **Lag effects:** characterize lag-specific and cumulative effects through 0–21 days and evaluate possible mortality displacement/harvesting.
+3. **Temporal shifts:** compare prespecified periods only after verifying the observed data coverage, using a common locked DLNM specification and a formal coefficient-contrast test.
+4. **Vulnerable groups:** evaluate effect modification by age and sex and, if a valid residency variable is present, residency status.
+
+The protocol specifies individual-level mortality data, UTCI exposure, a time-stratified case-crossover design, conditional regression, DLNM exposure and lag splines, and a 0–21-day lag objective. The protocol also proposes comparison of 1990–2004 versus 2005–2018, but the actual years present in `analysis_ready_matrix` are treated as authoritative rather than assuming those periods exist. 
+
+**Important computational decision:** the old approach of fitting and retaining every candidate model, plus a 1,000-fold data-resample/refit bootstrap, is deliberately not used. Candidate fits are run **one at a time**, only diagnostics are retained, and the selected model is then refitted once. For derived quantities such as MMT, the primary uncertainty calculation uses **parametric Monte Carlo simulation from the fitted coefficient covariance matrix**, not repeated model refitting. This preserves coefficient-sampling uncertainty while avoiding hundreds/thousands of large case-crossover model fits.
+
+# 2. Packages and reproducibility
+
+```{r setup, message=FALSE, warning=FALSE}
+required <- c(
+  "dplyr", "tidyr", "purrr", "tibble", "ggplot2", "readr",
+  "lubridate", "splines", "dlnm", "gnm", "mixmeta",
+  "flextable", "officer", "MASS"
+)
+
+missing_pkgs <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs)) {
+  stop(
+    "Install required packages before running this document: ",
+    paste(missing_pkgs, collapse = ", ")
+  )
+}
+
+invisible(lapply(required, library, character.only = TRUE))
+
+set.seed(params$seed)
+
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", results = "asis"
+)
+
+dir.create("Results", showWarnings = FALSE)
+for (d in c(
+  "Descriptives", "Crossbasis", "Diagnostics", "CentreModels", "Meta",
+  "TemporalAdaptation", "Subgroups", "LagCharacterisation",
+  "AttributableFraction", "Objects"
+)) {
+  dir.create(file.path("Results", d), recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# 3. Load and validate the master analysis matrix
+
+The current matrix supplied for this analysis has 186,628 rows and 55 columns, including `stratum_id`, `centreid`, `sex`, `age_at_death`, `date`, `year`, `outcome`, `utci_mean`, and UTCI lag variables through at least `utci_lag28`.
+
+```{r load-data}
+if (exists(params$analysis_object, envir = .GlobalEnv)) {
+  analysis_ready_matrix <- get(params$analysis_object, envir = .GlobalEnv)
+} else if (file.exists("analysis_ready_matrix.rds")) {
+  analysis_ready_matrix <- readRDS("analysis_ready_matrix.rds")
+} else {
+  stop(
+    "Could not find `analysis_ready_matrix` in the R session and ",
+    "`analysis_ready_matrix.rds` was not found."
+  )
+}
+
+analysis_ready_matrix <- analysis_ready_matrix |> filter(is_tier2==1)
+
+
+
+dat <- tibble::as_tibble(analysis_ready_matrix)
+
+required_vars <- c(
+  "stratum_id", "centreid", "date", "year", "sex",
+  "age_at_death", "outcome", "utci_mean"
+)
+
+missing_required <- setdiff(required_vars, names(dat))
+if (length(missing_required)) {
+  stop("Missing required variables: ", paste(missing_required, collapse = ", "))
+}
+
+lag_cols_21 <- paste0("utci_lag", 0:params$max_lag_primary)
+missing_lags <- setdiff(lag_cols_21, names(dat))
+if (length(missing_lags)) {
+  stop("Primary 0–21 day lag variables are missing: ",
+       paste(missing_lags, collapse = ", "))
+}
+
+EXPOSURE_VAR <- "utci_mean"
+OUTCOME_VAR <- "outcome"
+STRATUM_VAR <- "stratum_id"
+LAG_PREFIX <- "utci_lag"
+
+dat <- dat %>%
+  mutate(
+    date = as.Date(date),
+    year = as.integer(year),
+    outcome = as.numeric(outcome)
+  )
+
+stopifnot(all(dat[[OUTCOME_VAR]] %in% c(0, 1, NA)))
+```
+
+## 3.1 Data structure QC
+
+```{r data-qc}
+qc_overall <- tibble(
+  metric = c(
+    "Rows", "Columns", "Deaths", "Unique strata", "Centres",
+    "Minimum year", "Maximum year", "Missing UTCI", "Missing date",
+    "Missing stratum", "Missing outcome"
+  ),
+  value = c(
+    nrow(dat), ncol(dat), sum(dat[[OUTCOME_VAR]] == 1, na.rm = TRUE),
+    dplyr::n_distinct(dat[[STRATUM_VAR]]),
+    dplyr::n_distinct(dat$centreid),
+    min(dat$year, na.rm = TRUE), max(dat$year, na.rm = TRUE),
+    sum(is.na(dat[[EXPOSURE_VAR]])), sum(is.na(dat$date)),
+    sum(is.na(dat[[STRATUM_VAR]])), sum(is.na(dat[[OUTCOME_VAR]]))
+  )
+)
+
+qc_overall %>% flextable::flextable() %>% flextable::autofit()
+write.csv(qc_overall, "Results/Diagnostics/Table_QC_Overall.csv", row.names = FALSE)
+```
+
+```{r stratum-qc}
+stratum_qc <- dat %>%
+  group_by(.data[[STRATUM_VAR]]) %>%
+  summarise(
+    n = n(),
+    deaths = sum(.data[[OUTCOME_VAR]] == 1, na.rm = TRUE),
+    unique_dates = n_distinct(date),
+    .groups = "drop"
+  )
+
+stratum_qc %>%
+  summarise(
+    n_strata = n(),
+    strata_with_exactly_one_death = sum(deaths == 1),
+    strata_with_gt1_death = sum(deaths > 1),
+    median_rows = median(n),
+    max_rows = max(n)
+  ) %>%
+  flextable::flextable() %>% flextable::autofit()
+```
+
+# 4. Helper functions
+
+## 4.1 Model fitting
+
+```{r helpers-models}
+build_lag_basis <- function(max_lag, lag_df = NULL, lag_knots = NULL) {
+  if (!is.null(lag_knots)) {
+    list(fun = "ns", knots = lag_knots, intercept = TRUE)
+  } else {
+    list(fun = "ns", df = lag_df, intercept = TRUE)
+  }
+}
+
+compute_qaic <- function(fit) {
+  ll <- tryCatch(as.numeric(logLik(fit)), error = function(e) NA_real_)
+  phi <- tryCatch(summary(fit)$dispersion, error = function(e) NA_real_)
+  k <- length(coef(fit))
+  if (is.na(ll) || is.na(phi)) return(NA_real_)
+  -2 * ll / phi + 2 * k
+}
+
+compute_model_metrics <- function(
+    fit, cb, MMT, max_lag, exposure_df, lag_df, max_RR = NA_real_) {
+
+  rank_cb <- qr(cb)$rank
+
+  tibble(
+    max_lag = max_lag,
+    exposure_df = exposure_df,
+    lag_df = lag_df,
+    converged = isTRUE(fit$converged),
+    dispersion = tryCatch(summary(fit)$dispersion, error = function(e) NA_real_),
+    QAIC = compute_qaic(fit),
+    rank = rank_cb,
+    n_basis = ncol(cb),
+    full_rank = rank_cb == ncol(cb),
+    kappa = tryCatch(kappa(cb), error = function(e) NA_real_),
+    MMT = MMT,
+    max_RR = max_RR
+  )
+}
+
+run_dlnm_spec <- function(
+    data, max_lag, exposure_df, lag_df,
+    var_knots = NULL, lag_knots = NULL,
+    exposure_var = EXPOSURE_VAR, outcome_var = OUTCOME_VAR,
+    stratum_var = STRATUM_VAR, lag_prefix = LAG_PREFIX,
+    mmt_probs = c(params$mmt_search_low, params$mmt_search_high),
+    by = 0.1, cen = NULL) {
+
+  lag_cols <- paste0(lag_prefix, 0:max_lag)
+
+  if (!all(lag_cols %in% names(data))) return(NULL)
+
+  lag_matrix <- as.matrix(data[, lag_cols, drop = FALSE])
+  keep <- complete.cases(lag_matrix) &
+    !is.na(data[[exposure_var]]) &
+    !is.na(data[[outcome_var]]) &
+    !is.na(data[[stratum_var]])
+
+  d <- data[keep, , drop = FALSE]
+  lag_matrix <- lag_matrix[keep, , drop = FALSE]
+
+  if (!nrow(d)) return(NULL)
+
+  if (is.null(var_knots)) {
+    var_knots <- dlnm::equalknots(
+      d[[exposure_var]], fun = "ns", df = exposure_df
+    )
+  }
+
+  lag_basis <- build_lag_basis(max_lag, lag_df, lag_knots)
+
+  cb <- tryCatch(
+    dlnm::crossbasis(
+      lag_matrix,
+      lag = max_lag,
+      argvar = list(fun = "ns", knots = var_knots),
+      arglag = lag_basis
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(cb)) return(NULL)
+
+  fit <- tryCatch(
+    gnm::gnm(
+      as.formula(paste0(outcome_var, " ~ cb")),
+      eliminate = factor(d[[stratum_var]]),
+      family = quasipoisson(),
+      data = d
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(NULL)
+
+  q <- quantile(
+    d[[exposure_var]],
+    probs = mmt_probs,
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  pred0 <- tryCatch(
+    dlnm::crosspred(cb, fit, by = by, model.link = "log"),
+    error = function(e) NULL
+  )
+
+  MMT <- NA_real_
+  max_RR <- NA_real_
+
+  if (!is.null(pred0)) {
+    in_search <- pred0$predvar >= q[1] &
+      pred0$predvar <= q[2]
+
+    if (any(in_search)) {
+      MMT <- pred0$predvar[in_search][
+        which.min(pred0$allRRfit[in_search])
+      ]
+    }
+
+    max_RR <- max(pred0$allRRfit, na.rm = TRUE)
+  }
+
+  centre_value <- if (is.null(cen)) {
+    if (is.na(MMT)) median(d[[exposure_var]], na.rm = TRUE) else MMT
+  } else {
+    cen
+  }
+
+  pred <- tryCatch(
+    dlnm::crosspred(
+      cb, fit, cen = centre_value, by = by, model.link = "log"
+    ),
+    error = function(e) pred0
+  )
+
+  list(
+    cb = cb,
+    fit = fit,
+    pred = pred,
+    pred0 = pred0,
+    MMT = MMT,
+    var_knots = var_knots,
+    lag_basis = lag_basis,
+    metrics = compute_model_metrics(
+      fit, cb, MMT, max_lag, exposure_df, lag_df, max_RR
+    )
+  )
+}
+```
+
+## 4.2 Model-selection gates
+
+```{r helpers-selection}
+apply_decision_rule <- function(
+    metrics_tbl,
+    mmt_range = c(params$mmt_search_low, params$mmt_search_high),
+    kappa_max = params$kappa_max,
+    dispersion_max = params$dispersion_max,
+    qaic_tol = params$qaic_tolerance,
+    max_rr_threshold = params$max_rr_plausible,
+    min_mmt_threshold = params$mmt_min_plausible) {
+
+  gate_report <- metrics_tbl %>%
+    mutate(
+      fail_convergence = !converged | !full_rank,
+      fail_kappa = !is.na(kappa) & kappa > kappa_max,
+      fail_dispersion = !is.na(dispersion) & dispersion > dispersion_max,
+      fail_mmt_range = is.na(MMT) |
+        MMT < quantile(dat[[EXPOSURE_VAR]], mmt_range[1], na.rm = TRUE) |
+        MMT > quantile(dat[[EXPOSURE_VAR]], mmt_range[2], na.rm = TRUE),
+      fail_max_rr = !is.na(max_RR) & max_RR > max_rr_threshold,
+      fail_min_mmt = !is.na(MMT) & MMT < min_mmt_threshold
+    ) %>%
+    mutate(
+      passed_all_gates =
+        !fail_convergence &
+        !fail_kappa &
+        !fail_dispersion &
+        !fail_mmt_range &
+        !fail_max_rr &
+        !fail_min_mmt
+    )
+
+  candidates <- gate_report %>%
+    filter(passed_all_gates)
+
+  if (!nrow(candidates)) {
+    return(list(
+      best_model = NULL,
+      candidates = candidates,
+      gate_report = gate_report
+    ))
+  }
+
+  # Prefer the best likelihood-supported model, then QAIC within tolerance,
+  # then parsimony and numerical stability.
+  best_ll <- max(candidates$QAIC * -1, na.rm = TRUE)
+  candidates <- candidates %>%
+    mutate(ll_rank = QAIC * -1) %>%
+    filter(ll_rank >= best_ll - qaic_tol) %>%
+    arrange(QAIC, exposure_df, lag_df, n_basis, kappa)
+
+  list(
+    best_model = candidates[1, , drop = FALSE],
+    candidates = candidates,
+    gate_report = gate_report
+  )
+}
+```
+
+# 5. Objective 1 — exposure–response
+
+## 5.1 Descriptive exposure distribution
+
+```{r obj1-descriptives}
+case_days <- dat %>% filter(.data[[OUTCOME_VAR]] == 1)
+
+utci_summary <- case_days %>%
+  summarise(
+    N_deaths = n(),
+    mean = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    sd = sd(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    p01 = quantile(.data[[EXPOSURE_VAR]], .01, na.rm = TRUE),
+    p05 = quantile(.data[[EXPOSURE_VAR]], .05, na.rm = TRUE),
+    p50 = quantile(.data[[EXPOSURE_VAR]], .50, na.rm = TRUE),
+    p95 = quantile(.data[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    p99 = quantile(.data[[EXPOSURE_VAR]], .99, na.rm = TRUE),
+    min = min(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    max = max(.data[[EXPOSURE_VAR]], na.rm = TRUE)
+  )
+
+utci_summary %>% flextable::flextable() %>% flextable::autofit()
+write.csv(utci_summary, "Results/Descriptives/Table_UTCI_summary.csv", row.names = FALSE)
+
+ggplot(case_days, aes(.data[[EXPOSURE_VAR]])) +
+  geom_histogram(bins = 60) +
+  labs(x = "UTCI (°C)", y = "Deaths", title = "UTCI distribution on case days")
+
+ggsave(
+  "Results/Descriptives/UTCI_Histogram.png",
+  width = 8, height = 6, dpi = 300
+)
+```
+
+```{r obj1-centre-summary}
+centre_summary <- dat %>%
+  group_by(centreid, centre_name, country, climate_zone) %>%
+  summarise(
+    observations = n(),
+    deaths = sum(.data[[OUTCOME_VAR]] == 1, na.rm = TRUE),
+    mean_utci = mean(.data[[EXPOSURE_VAR]], na.rm = TRUE),
+    p05 = quantile(.data[[EXPOSURE_VAR]], .05, na.rm = TRUE),
+    p50 = quantile(.data[[EXPOSURE_VAR]], .50, na.rm = TRUE),
+    p95 = quantile(.data[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+centre_summary %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  centre_summary,
+  "Results/Descriptives/Table_Centre_UTCI.csv",
+  row.names = FALSE
+)
+```
+
+## 5.2 Candidate crossbasis search — memory-safe implementation
+
+**Memory rule:** do not create `all_results` containing every fitted model. Each candidate is fitted, reduced to diagnostics, and immediately released.
+
+```{r obj1-candidate-search}
+candidate_specs <- tidyr::expand_grid(
+  max_lag = params$candidate_lags,
+  exposure_df = params$exposure_df_candidates,
+  lag_df = params$lag_df_candidates
+) %>%
+  mutate(
+    model_id = paste0(
+      "Lag", max_lag, "_E", exposure_df, "_L", lag_df
+    )
+  )
+
+candidate_metrics <- vector("list", nrow(candidate_specs))
+
+for (i in seq_len(nrow(candidate_specs))) {
+
+  spec <- candidate_specs[i, ]
+
+  message(
+    "Fitting ", spec$model_id, " (", i, "/", nrow(candidate_specs), ")"
+  )
+
+  res <- tryCatch(
+    run_dlnm_spec(
+      dat,
+      max_lag = spec$max_lag,
+      exposure_df = spec$exposure_df,
+      lag_df = spec$lag_df
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(res)) {
+    candidate_metrics[[i]] <- res$metrics %>%
+      mutate(model_id = spec$model_id)
+  }
+
+  # Explicitly release the large crossbasis/model before the next candidate.
+  rm(res)
+  invisible(gc())
+}
+
+diagnostics_tbl <- bind_rows(candidate_metrics)
+
+write.csv(
+  diagnostics_tbl,
+  "Results/Crossbasis/Candidate_Model_Diagnostics.csv",
+  row.names = FALSE
+)
+
+diagnostics_tbl %>%
+  arrange(QAIC) %>%
+  flextable::flextable() %>%
+  flextable::autofit()
+```
+
+## 5.3 Lock the primary specification
+
+```{r obj1-model-selection}
+decision <- apply_decision_rule(diagnostics_tbl)
+
+decision$gate_report %>%
+  arrange(desc(passed_all_gates), QAIC) %>%
+  flextable::flextable() %>%
+  flextable::autofit()
+```
+
+```{r obj1-lock}
+if (is.null(decision$best_model)) {
+  stop(
+    "No candidate passed all diagnostic/plausibility gates. ",
+    "Do not relax the gates automatically. Inspect ",
+    "Results/Crossbasis/Candidate_Model_Diagnostics.csv and the gate report."
+  )
+}
+
+best_id <- decision$best_model$model_id[[1]]
+
+best_row <- candidate_specs %>%
+  filter(model_id == best_id)
+
+best_spec <- list(
+  model_id = best_id,
+  max_lag = best_row$max_lag[[1]],
+  exposure_df = best_row$exposure_df[[1]],
+  lag_df = best_row$lag_df[[1]]
+)
+
+# Refit the selected model ONCE.
+best_fit <- run_dlnm_spec(
+  dat,
+  max_lag = best_spec$max_lag,
+  exposure_df = best_spec$exposure_df,
+  lag_df = best_spec$lag_df
+)
+
+if (is.null(best_fit)) {
+  stop("Selected model could not be refitted.")
+}
+
+best_spec$var_knots <- best_fit$var_knots
+best_spec$lag_knots <- best_fit$lag_basis$knots
+best_spec$MMT <- best_fit$MMT
+best_spec$cen <- best_fit$MMT
+
+MMT <- best_fit$MMT
+cb <- best_fit$cb
+fit <- best_fit$fit
+final_pred <- best_fit$pred
+
+saveRDS(best_spec, "Results/Objects/best_specification.rds")
+saveRDS(best_fit, "Results/Objects/best_model.rds")
+
+write.csv(
+  as.data.frame(best_fit$metrics),
+  "Results/Crossbasis/Locked_Model_Diagnostics.csv",
+  row.names = FALSE
+)
+```
+
+## 5.4 Primary exposure–response curve
+
+```{r obj1-primary-curve, fig.width=8, fig.height=6}
+plot(
+  final_pred, "overall",
+  xlab = "UTCI (°C)",
+  ylab = "Relative Risk",
+  main = paste0(
+    "West Africa UTCI–mortality exposure–response\n",
+    "Locked model: ", best_id
+  )
+)
+abline(h = 1, lty = 2)
+abline(v = MMT, lty = 2)
+```
+
+## 5.5 Primary contrasts
+
+The contrasts are evaluated at percentiles because they are interpretable and avoid extrapolation beyond the observed exposure distribution.
+
+```{r obj1-contrasts}
+case_p <- quantile(
+  dat[[EXPOSURE_VAR]],
+  probs = c(.01, .05, .50, .95, .99),
+  na.rm = TRUE
+)
+
+contrast_values <- c(
+  "P01_vs_MMT" = case_p[1],
+  "P05_vs_MMT" = case_p[2],
+  "P95_vs_MMT" = case_p[4],
+  "P99_vs_MMT" = case_p[5],
+  "MMT_plus_5" = MMT + 5,
+  "MMT_plus_8" = MMT + 8
+)
+
+get_rr <- function(pred, at) {
+  idx <- which.min(abs(pred$predvar - at))
+  tibble(
+    exposure = names(at),
+    UTCI = pred$predvar[idx],
+    RR = pred$allRRfit[idx],
+    lower = pred$allRRlow[idx],
+    upper = pred$allRRhigh[idx]
+  )
+}
+
+obj1_contrasts <- purrr::map_dfr(
+  contrast_values,
+  ~ get_rr(final_pred, c(value = .x))
+)
+
+# Replace the temporary exposure labels with stable names.
+obj1_contrasts$exposure <- names(contrast_values)
+
+obj1_contrasts %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  obj1_contrasts,
+  "Results/Crossbasis/Table_Objective1_RR_Contrasts.csv",
+  row.names = FALSE
+)
+```
+
+# 6. Objective 1 — centre-specific models and multivariate meta-analysis
+
+Only the reduced coefficient vectors and covariance matrices are retained for each centre. Full centre model objects are not accumulated in memory.
+
+```{r centre-functions}
+fit_one_centre_reduced <- function(
+    centre_data, centre_id, spec, cen,
+    min_deaths = params$min_centre_deaths,
+    max_kappa = params$kappa_max) {
+
+  n_deaths <- sum(centre_data[[OUTCOME_VAR]] == 1, na.rm = TRUE)
+
+  if (n_deaths < min_deaths) {
+    return(tibble(
+      centreid = centre_id,
+      included = FALSE,
+      reason = paste0(
+        "Too few deaths: ", n_deaths,
+        " < ", min_deaths
+      )
+    ))
+  }
+
+  res <- run_dlnm_spec(
+    centre_data,
+    max_lag = spec$max_lag,
+    exposure_df = spec$exposure_df,
+    lag_df = spec$lag_df,
+    var_knots = spec$var_knots,
+    lag_knots = spec$lag_knots,
+    cen = cen
+  )
+
+  if (is.null(res)) {
+    return(tibble(
+      centreid = centre_id,
+      included = FALSE,
+      reason = "Model fitting failed"
+    ))
+  }
+
+  m <- res$metrics
+
+  if (!isTRUE(m$converged)) {
+    return(tibble(
+      centreid = centre_id,
+      included = FALSE,
+      reason = "Non-convergence"
+    ))
+  }
+
+  if (!isTRUE(m$full_rank)) {
+    return(tibble(
+      centreid = centre_id,
+      included = FALSE,
+      reason = "Rank-deficient crossbasis"
+    ))
+  }
+
+  if (!is.na(m$kappa) && m$kappa > max_kappa) {
+    return(tibble(
+      centreid = centre_id,
+      included = FALSE,
+      reason = paste0("Kappa > ", max_kappa)
+    ))
+  }
+
+  reduced <- tryCatch(
+    dlnm::crossreduce(res$cb, res$fit, cen = cen),
+    error = function(e) NULL
+  )
+
+  if (is.null(reduced)) {
+    return(tibble(
+      centreid = centre_id,
+      included = FALSE,
+      reason = "crossreduce() failed"
+    ))
+  }
+
+  tibble(
+    centreid = centre_id,
+    included = TRUE,
+    reason = NA_character_,
+    centre_name = as.character(dplyr::first(centre_data$centre_name)),
+    country = as.character(dplyr::first(centre_data$country)),
+    climate_zone = as.character(dplyr::first(centre_data$climate_zone)),
+    n_deaths = n_deaths,
+    coefficients = list(unname(reduced$coefficients)),
+    vcov = list(reduced$vcov),
+    metrics = list(m)
+  )
+}
+
+fit_all_centres_reduced <- function(data, spec, cen) {
+
+  groups <- split(data, data$centreid)
+
+  out <- vector("list", length(groups))
+  ids <- names(groups)
+
+  for (i in seq_along(groups)) {
+    message("Centre ", i, "/", length(groups), ": ", ids[i])
+
+    out[[i]] <- fit_one_centre_reduced(
+      groups[[i]], ids[i], spec, cen
+    )
+
+    # Remove group-level objects before the next centre.
+    rm(groups[[i]])
+    invisible(gc())
+  }
+
+  bind_rows(out)
+}
+```
+
+```{r obj1-centre-models}
+centre_results <- fit_all_centres_reduced(
+  dat,
+  best_spec,
+  MMT
+)
+
+centre_results %>%
+  select(
+    centreid, centre_name, country, climate_zone,
+    included, reason, n_deaths
+  ) %>%
+  flextable::flextable() %>%
+  flextable::autofit()
+
+write.csv(
+  centre_results %>%
+    select(
+      centreid, centre_name, country, climate_zone,
+      included, reason, n_deaths
+    ),
+  "Results/CentreModels/Centre_QC.csv",
+  row.names = FALSE
+)
+
+included_centres <- centre_results %>%
+  filter(included)
+```
+
+```{r obj1-meta}
+if (nrow(included_centres) < 2) {
+  stop("Fewer than two centres passed centre-level QC; multivariate meta-analysis cannot be fitted.")
+}
+
+coef_matrix <- do.call(
+  rbind,
+  included_centres$coefficients
+)
+
+vcov_list <- included_centres$vcov
+
+west_africa_model <- tryCatch(
+  mixmeta::mixmeta(
+    coef_matrix,
+    vcov_list,
+    method = "reml"
+  ),
+  error = function(e) NULL
+)
+
+if (is.null(west_africa_model)) {
+  stop("mixmeta failed for the included centres.")
+}
+
+saveRDS(
+  west_africa_model,
+  "Results/Meta/WestAfrica_mixmeta.rds"
+)
+
+meta_summary <- tibble(
+  centres_included = nrow(included_centres),
+  centres_excluded = sum(!centre_results$included),
+  deaths_included = sum(included_centres$n_deaths),
+  model = "Multivariate random-effects meta-analysis (mixmeta)"
+)
+
+meta_summary %>%
+  flextable::flextable() %>% flextable::autofit()
+```
+
+```{r obj1-pooled-curve, fig.width=8, fig.height=6}
+meta_pred <- dlnm::crosspred(
+  cb,
+  coef = coef(west_africa_model),
+  vcov = vcov(west_africa_model),
+  model.link = "log",
+  by = 0.1,
+  cen = MMT
+)
+
+saveRDS(meta_pred, "Results/Meta/WestAfrica_prediction.rds")
+
+plot(
+  meta_pred, "overall",
+  xlab = "UTCI (°C)",
+  ylab = "Relative Risk",
+  main = "Pooled West Africa UTCI–mortality exposure–response"
+)
+abline(h = 1, lty = 2)
+abline(v = MMT, lty = 2)
+```
+
+# 7. Bootstrap / Monte Carlo uncertainty — computationally safe version
+
+## 7.1 Why a conventional bootstrap is not the primary method
+
+A naive bootstrap would repeatedly resample the case-crossover data and refit the DLNM. With 186,628 rows, 21+ lag columns, conditional strata, and nonlinear crossbasis terms, hundreds or thousands of full refits can cause:
+
+- very high RAM use;
+- duplicated large design matrices;
+- long runtimes;
+- parallel-worker memory multiplication;
+- failed convergence in some resamples;
+- excessive temporary model objects.
+
+For this analysis, the primary uncertainty for **derived quantities from the locked model** is therefore obtained by drawing from the fitted multivariate normal coefficient distribution and evaluating the nonlinear prediction repeatedly. This is computationally much cheaper because it does not recreate the data or refit `gnm`.
+
+The existing project script already moved away from a 1,000-refit bootstrap to this Monte Carlo approach. That decision is retained and strengthened here by storing only compact matrices and using chunked simulation.
+
+## 7.2 Memory-safe Monte Carlo MMT uncertainty
+
+```{r mmt-mc}
+mmt_mc_uncertainty <- function(
+    fit, cb, exposure_data,
+    mmt_range = c(params$mmt_search_low, params$mmt_search_high),
+    by = 0.1, nsim = params$mc_draws,
+    seed = params$seed,
+    chunk_size = 250) {
+
+  set.seed(seed)
+
+  b <- coef(fit)
+  V <- vcov(fit)
+
+  # Numerical stabilisation for tiny asymmetries in the covariance matrix.
+  V <- (V + t(V)) / 2
+
+  # Cholesky is substantially more memory-efficient than storing all
+  # coefficient draws at once.
+  R <- tryCatch(chol(V), error = function(e) NULL)
+
+  if (is.null(R)) {
+    V <- V + diag(1e-8, nrow(V))
+    R <- chol(V)
+  }
+
+  q <- quantile(
+    exposure_data,
+    probs = mmt_range,
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  base_pred <- dlnm::crosspred(
+    cb, coef = b, vcov = V,
+    model.link = "log", by = by
+  )
+
+  predvar <- base_pred$predvar
+  in_range <- predvar >= q[1] & predvar <= q[2]
+
+  mmt_sim <- rep(NA_real_, nsim)
+
+  # Do not allocate nsim x n_prediction_points matrices.
+  # One chunk is evaluated and immediately discarded.
+  starts <- seq(1, nsim, by = chunk_size)
+
+  for (s in starts) {
+
+    e <- min(s + chunk_size - 1, nsim)
+    n <- e - s + 1
+
+    Z <- matrix(rnorm(n * length(b)), nrow = n)
+    beta_draws <- sweep(Z %*% R, 2, b, "+")
+
+    for (j in seq_len(n)) {
+
+      # crosspred() requires the coefficient vector corresponding to the
+      # crossbasis. We do not request a covariance matrix for each draw.
+      pr <- tryCatch(
+        dlnm::crosspred(
+          cb,
+          coef = beta_draws[j, ],
+          model.link = "log",
+          by = by
+        ),
+        error = function(e) NULL
+      )
+
+      if (is.null(pr)) next
+
+      log_rr <- log(pr$allRRfit)
+
+      if (any(in_range)) {
+        x <- predvar[in_range]
+        y <- log_rr[in_range]
+
+        if (length(unique(x)) >= 4 && all(is.finite(y))) {
+          sf <- tryCatch(
+            splinefun(x, y, method = "natural"),
+            error = function(e) NULL
+          )
+
+          if (!is.null(sf)) {
+            opt <- tryCatch(
+              optimize(
+                sf,
+                interval = range(x)
+              ),
+              error = function(e) NULL
+            )
+
+            if (!is.null(opt)) {
+              mmt_sim[s + j - 1] <- opt$minimum
+            }
+          }
+        }
+      }
+    }
+
+    rm(Z, beta_draws)
+    invisible(gc())
+  }
+
+  list(
+    mmt = mmt_sim,
+    predvar = predvar,
+    fitted = base_pred$allRRfit
+  )
+}
+
+mmt_mc <- mmt_mc_uncertainty(
+  fit,
+  cb,
+  dat[[EXPOSURE_VAR]]
+)
+
+mmt_summary <- tibble(
+  simulations = sum(is.finite(mmt_mc$mmt)),
+  failed = sum(!is.finite(mmt_mc$mmt)),
+  median_MMT = median(mmt_mc$mmt, na.rm = TRUE),
+  CI_low = quantile(mmt_mc$mmt, .025, na.rm = TRUE),
+  CI_high = quantile(mmt_mc$mmt, .975, na.rm = TRUE)
+)
+
+mmt_summary %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  mmt_summary,
+  "Results/Diagnostics/MMT_MonteCarlo_Uncertainty.csv",
+  row.names = FALSE
+)
+
+saveRDS(
+  mmt_mc$mmt,
+  "Results/Diagnostics/MMT_MonteCarlo_Draws.rds"
+)
+```
+
+## 7.3 Optional genuine resampling bootstrap
+
+This is **not run by default**. It is included only as a sensitivity analysis if reviewers specifically require nonparametric resampling.
+
+The bootstrap is performed at the **case/stratum level**, not by independently resampling individual rows, because rows within a case-crossover stratum are dependent. It is also deliberately capped and sequential.
+
+```{r optional-bootstrap, eval=FALSE}
+# OPTIONAL ONLY.
+# Do not run thousands of full refits on the complete matrix.
+#
+# Recommended reviewer-sensitivity configuration:
+#   B = 100–200
+#   sequential execution
+#   no parallel workers
+#   save only scalar/compact results after each iteration
+#
+# A full nonparametric bootstrap remains computationally expensive and can
+# still fail in individual replicates. It should not replace the primary
+# coefficient-Monte-Carlo uncertainty analysis above.
+
+bootstrap_mmt_refit <- function(
+    data, spec, B = 200, seed = params$seed) {
+
+  set.seed(seed)
+
+  strata <- unique(data[[STRATUM_VAR]])
+  out <- rep(NA_real_, B)
+
+  for (b in seq_len(B)) {
+
+    sampled_strata <- sample(strata, length(strata), replace = TRUE)
+
+    boot <- purrr::map_dfr(
+      sampled_strata,
+      function(s) {
+        data[data[[STRATUM_VAR]] == s, , drop = FALSE]
+      }
+    )
+
+    res <- tryCatch(
+      run_dlnm_spec(
+        boot,
+        max_lag = spec$max_lag,
+        exposure_df = spec$exposure_df,
+        lag_df = spec$lag_df,
+        var_knots = spec$var_knots,
+        lag_knots = spec$lag_knots
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(res)) out[b] <- res$MMT
+
+    rm(boot, res)
+    invisible(gc())
+
+    # Incremental checkpoint prevents losing completed iterations.
+    saveRDS(
+      out,
+      file.path(
+        "Results/Diagnostics",
+        paste0("Optional_bootstrap_MMT_B", B, ".rds")
+      )
+    )
+  }
+
+  out
+}
+
+# Example:
+# boot_mmt <- bootstrap_mmt_refit(dat, best_spec, B = 200)
+```
+
+# 8. Objective 2 — lag-response and harvesting
+
+```{r obj2-lag-helper}
+summarize_lag_windows <- function(pred, at, max_lag, label) {
+
+  idx <- which.min(abs(pred$predvar - at))
+  log_rr_by_lag <- log(pred$matRRfit[idx, ])
+  lag_days <- 0:(length(log_rr_by_lag) - 1)
+
+  windows <- list(
+    Immediate = c(0, 0),
+    Short = c(1, 3),
+    Medium = c(4, 7),
+    Delayed = c(8, min(14, max_lag)),
+    Harvesting = c(min(15, max_lag), max_lag)
+  )
+
+  windows <- windows[
+    !duplicated(purrr::map(windows, ~ paste(.x, collapse = "-")))
+  ]
+
+  purrr::map_dfr(names(windows), function(w) {
+
+    rng <- windows[[w]]
+    sel <- lag_days >= rng[1] & lag_days <= rng[2]
+
+    tibble(
+      exposure_condition = label,
+      exposure_UTCI = pred$predvar[idx],
+      window = w,
+      lag_days = paste0(rng[1], "-", rng[2]),
+      RR = exp(sum(log_rr_by_lag[sel], na.rm = TRUE))
+    )
+  })
+}
+```
+
+```{r obj2-lag-windows}
+lag_conditions <- c(
+  "Moderate heat" = MMT + 5,
+  "Extreme heat" = MMT + 8,
+  "Cold" = MMT - 5
+)
+
+lag_windows_tbl <- purrr::imap_dfr(
+  lag_conditions,
+  ~ summarize_lag_windows(
+    final_pred,
+    .x,
+    best_spec$max_lag,
+    .y
+  )
+)
+
+lag_windows_tbl %>%
+  mutate(
+    RR = round(RR, 3)
+  ) %>%
+  flextable::flextable() %>%
+  flextable::autofit()
+
+write.csv(
+  lag_windows_tbl,
+  "Results/LagCharacterisation/Lag_Window_Summary.csv",
+  row.names = FALSE
+)
+
+ggplot(
+  lag_windows_tbl,
+  aes(window, RR, fill = exposure_condition)
+) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 1, linetype = 2) +
+  labs(
+    title = "Cumulative RR by lag window",
+    x = NULL,
+    y = "Cumulative relative risk",
+    fill = NULL
+  )
+
+ggsave(
+  "Results/LagCharacterisation/Lag_Window_Barplot.png",
+  width = 8, height = 5, dpi = 300
+)
+```
+
+## 8.1 Lag-response slices
+
+```{r obj2-lag-curves, fig.width=8, fig.height=7}
+par(mfrow = c(3, 1))
+
+for (nm in names(lag_conditions)) {
+
+  at <- lag_conditions[[nm]]
+  at_snapped <- final_pred$predvar[
+    which.min(abs(final_pred$predvar - at))
+  ]
+
+  plot(
+    final_pred,
+    "slices",
+    var = at_snapped,
+    ci = "lines",
+    xlab = "Lag (days)",
+    ylab = "RR",
+    main = paste0(
+      nm, ": UTCI = ", round(at_snapped, 1), "°C"
+    )
+  )
+
+  abline(h = 1, lty = 2)
+}
+
+par(mfrow = c(1, 1))
+```
+
+**Interpretation rule:** a decline below RR=1 at later lags is not automatically evidence of harvesting. The displacement interpretation is strongest when an early excess is followed by a compensatory deficit, while the cumulative association is simultaneously examined. A cumulative RR that remains elevated through the later lag period is more consistent with persistent excess mortality than simple short-term displacement.
+
+# 9. Objective 3 — temporal shifts
+
+The protocol gives 1990–2004 versus 2005–2018 as an example. The actual matrix is checked first. The periods are **not silently replaced by the old example 2009–2012 versus 2013–2016**.
+
+```{r obj3-periods}
+data_years <- range(dat$year, na.rm = TRUE)
+
+protocol_periods <- list(
+  early = c(1990, 2004),
+  late = c(2005, 2018)
+)
+
+periods <- lapply(
+  protocol_periods,
+  function(x) c(
+    max(x[1], data_years[1]),
+    min(x[2], data_years[2])
+  )
+)
+
+valid_periods <- periods[
+  vapply(
+    periods,
+    function(x) x[1] <= x[2],
+    logical(1)
+  )
+]
+
+period_check <- tibble(
+  period = names(periods),
+  requested_start = sapply(protocol_periods, `[`, 1),
+  requested_end = sapply(protocol_periods, `[`, 2),
+  observed_start = sapply(periods, `[`, 1),
+  observed_end = sapply(periods, `[`, 2),
+  valid = names(periods) %in% names(valid_periods)
+)
+
+period_check %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  period_check,
+  "Results/TemporalAdaptation/Period_Check.csv",
+  row.names = FALSE
+)
+```
+
+```{r obj3-period-models}
+fit_period <- function(data, rng, spec, cen) {
+
+  pd <- data %>%
+    filter(
+      year >= rng[1],
+      year <= rng[2]
+    )
+
+  if (!nrow(pd)) return(NULL)
+
+  centre_res <- fit_all_centres_reduced(
+    pd, spec, cen
+  )
+
+  inc <- centre_res %>% filter(included)
+
+  if (nrow(inc) < 2) return(NULL)
+
+  cm <- do.call(rbind, inc$coefficients)
+
+  mf <- tryCatch(
+    mixmeta::mixmeta(
+      cm,
+      inc$vcov,
+      method = "reml"
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(mf)) return(NULL)
+
+  list(
+    range = rng,
+    centre_results = centre_res,
+    meta_fit = mf,
+    n_centres = nrow(inc),
+    deaths = sum(inc$n_deaths)
+  )
+}
+
+period_fits <- purrr::imap(
+  valid_periods,
+  ~ fit_period(dat, .x, best_spec, MMT)
+)
+
+period_fits <- period_fits[!vapply(period_fits, is.null, logical(1))]
+
+if (length(period_fits) < 2) {
+  warning(
+    "Fewer than two valid temporal periods were available; ",
+    "formal temporal contrast cannot be estimated."
+  )
+}
+```
+
+## 9.1 Formal comparison
+
+```{r obj3-formal-contrast}
+if (length(period_fits) >= 2) {
+
+  period_names <- names(period_fits)[1:2]
+
+  b1 <- coef(period_fits[[1]]$meta_fit)
+  b2 <- coef(period_fits[[2]]$meta_fit)
+
+  V1 <- vcov(period_fits[[1]]$meta_fit)
+  V2 <- vcov(period_fits[[2]]$meta_fit)
+
+  delta <- b2 - b1
+  Vdelta <- (V1 + V2) / 1
+
+  W <- as.numeric(
+    t(delta) %*% solve(Vdelta, delta)
+  )
+
+  df_wald <- length(delta)
+  p_wald <- pchisq(W, df = df_wald, lower.tail = FALSE)
+
+  temporal_wald <- tibble(
+    comparison = paste0(
+      period_names[2], " minus ", period_names[1]
+    ),
+    Wald_statistic = W,
+    df = df_wald,
+    p_value = p_wald
+  )
+
+  temporal_wald %>%
+    flextable::flextable() %>% flextable::autofit()
+
+  write.csv(
+    temporal_wald,
+    "Results/TemporalAdaptation/Formal_Temporal_Contrast.csv",
+    row.names = FALSE
+  )
+}
+```
+
+## 9.2 Period-specific pooled curves
+
+```{r obj3-curves, fig.width=8, fig.height=6}
+if (length(period_fits) >= 2) {
+
+  pred_periods <- purrr::imap(
+    period_fits,
+    ~ dlnm::crosspred(
+      cb,
+      coef = coef(.x$meta_fit),
+      vcov = vcov(.x$meta_fit),
+      model.link = "log",
+      by = 0.1,
+      cen = MMT
+    )
+  )
+
+  plot(
+    pred_periods[[1]], "overall",
+    xlab = "UTCI (°C)",
+    ylab = "Relative Risk",
+    main = "Temporal comparison of UTCI–mortality curves"
+  )
+
+  lines(
+    pred_periods[[2]]$predvar,
+    pred_periods[[2]]$allRRfit,
+    lwd = 2
+  )
+
+  abline(h = 1, lty = 2)
+  abline(v = MMT, lty = 2)
+}
+```
+
+Temporal differences are interpreted as **changes in vulnerability over time**, not automatically as proof of causal adaptation. Changes in centre composition, mortality ascertainment, exposure distributions, population structure, and other unmeasured factors can also produce temporal differences.
+
+# 10. Objective 4 — vulnerable groups
+
+## 10.1 Validate sex coding before interpretation
+
+```{r obj4-sex-qc}
+sex_distribution <- dat %>%
+  count(sex, name = "n") %>%
+  mutate(percent = 100 * n / sum(n))
+
+sex_distribution %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  sex_distribution,
+  "Results/Subgroups/Sex_Code_Distribution.csv",
+  row.names = FALSE
+)
+```
+
+The matrix contains numeric sex codes, but the supplied matrix does not include a codebook in the columns shown. Therefore the analysis does **not** silently label code 1 as male or code 2 as female. The statistical results are first produced using the observed codes; publication labels must be attached only after the project data dictionary confirms their meaning.
+
+## 10.2 Age groups based on the protocol thresholds
+
+The protocol identifies children around age 5 and elderly people around age 65. Because `age_at_death` is available, the primary subgroup definitions are generated directly from the continuous age variable rather than assuming that the existing factor labels correspond exactly to those thresholds.
+
+```{r obj4-age-groups}
+dat <- dat %>%
+  mutate(
+    subgroup_age_child = age_at_death <= 5,
+    subgroup_age_elderly = age_at_death >= 65
+  )
+
+age_subgroup_counts <- tibble(
+  subgroup = c("Age <=5 years", "Age >=65 years"),
+  deaths = c(
+    sum(dat$subgroup_age_child & dat[[OUTCOME_VAR]] == 1, na.rm = TRUE),
+    sum(dat$subgroup_age_elderly & dat[[OUTCOME_VAR]] == 1, na.rm = TRUE)
+  ),
+  rows = c(
+    sum(dat$subgroup_age_child, na.rm = TRUE),
+    sum(dat$subgroup_age_elderly, na.rm = TRUE)
+  )
+)
+
+age_subgroup_counts %>%
+  flextable::flextable() %>% flextable::autofit()
+```
+
+## 10.3 Subgroup DLNMs
+
+```{r obj4-subgroup-fit}
+subgroup_data <- list(
+  Age_le_5 = dat %>% filter(subgroup_age_child),
+  Age_ge_65 = dat %>% filter(subgroup_age_elderly)
+)
+
+# Sex groups are retained as code-labelled groups until the data dictionary
+# confirms the meaning of the numeric codes.
+for (sx in sort(unique(na.omit(dat$sex)))) {
+  subgroup_data[[paste0("Sex_code_", sx)]] <-
+    dat %>% filter(sex == sx)
+}
+
+subgroup_fits <- list()
+
+for (nm in names(subgroup_data)) {
+
+  message("Fitting subgroup: ", nm)
+
+  dsub <- subgroup_data[[nm]]
+
+  subgroup_fits[[nm]] <- tryCatch(
+    run_dlnm_spec(
+      dsub,
+      max_lag = best_spec$max_lag,
+      exposure_df = best_spec$exposure_df,
+      lag_df = best_spec$lag_df,
+      var_knots = best_spec$var_knots,
+      lag_knots = best_spec$lag_knots,
+      cen = MMT
+    ),
+    error = function(e) NULL
+  )
+
+  rm(dsub)
+  invisible(gc())
+}
+```
+
+## 10.4 Subgroup estimates
+
+```{r obj4-subgroup-estimates}
+subgroup_summary <- purrr::imap_dfr(
+  subgroup_fits,
+  function(res, nm) {
+
+    if (is.null(res)) {
+      return(tibble(
+        subgroup = nm,
+        MMT = NA_real_,
+        QAIC = NA_real_,
+        dispersion = NA_real_,
+        kappa = NA_real_,
+        converged = FALSE
+      ))
+    }
+
+    tibble(
+      subgroup = nm,
+      MMT = res$MMT,
+      QAIC = res$metrics$QAIC,
+      dispersion = res$metrics$dispersion,
+      kappa = res$metrics$kappa,
+      converged = res$metrics$converged
+    )
+  }
+)
+
+subgroup_summary %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  subgroup_summary,
+  "Results/Subgroups/Subgroup_Model_QC.csv",
+  row.names = FALSE
+)
+```
+
+## 10.5 Formal effect-modification tests
+
+Because the age-defined groups and sex-code groups are mutually exclusive, their coefficient estimates can be compared using a multivariate Wald test, provided both subgroup models converge and use the same locked basis.
+
+```{r obj4-interactions}
+wald_compare <- function(res1, res2, label1, label2) {
+
+  if (is.null(res1) || is.null(res2)) return(NULL)
+
+  r1 <- tryCatch(
+    dlnm::crossreduce(res1$cb, res1$fit, cen = MMT),
+    error = function(e) NULL
+  )
+
+  r2 <- tryCatch(
+    dlnm::crossreduce(res2$cb, res2$fit, cen = MMT),
+    error = function(e) NULL
+  )
+
+  if (is.null(r1) || is.null(r2)) return(NULL)
+
+  if (length(r1$coefficients) != length(r2$coefficients)) {
+    return(NULL)
+  }
+
+  delta <- r2$coefficients - r1$coefficients
+  Vdelta <- r1$vcov + r2$vcov
+
+  W <- as.numeric(
+    t(delta) %*% solve(Vdelta, delta)
+  )
+
+  tibble(
+    group_1 = label1,
+    group_2 = label2,
+    Wald = W,
+    df = length(delta),
+    p_value = pchisq(
+      W, df = length(delta), lower.tail = FALSE
+    )
+  )
+}
+
+interaction_results <- bind_rows(
+  wald_compare(
+    subgroup_fits$Age_le_5,
+    subgroup_fits$Age_ge_65,
+    "Age <=5",
+    "Age >=65"
+  )
+)
+
+for (sx in sort(unique(na.omit(dat$sex)))) {
+  other_sx <- sort(unique(na.omit(dat$sex)))
+  other_sx <- other_sx[other_sx != sx][1]
+
+  if (!is.na(other_sx)) {
+    nm1 <- paste0("Sex_code_", sx)
+    nm2 <- paste0("Sex_code_", other_sx)
+
+    interaction_results <- bind_rows(
+      interaction_results,
+      wald_compare(
+        subgroup_fits[[nm1]],
+        subgroup_fits[[nm2]],
+        nm1,
+        nm2
+      )
+    )
+  }
+}
+
+interaction_results %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  interaction_results,
+  "Results/Subgroups/Formal_Effect_Modification_Tests.csv",
+  row.names = FALSE
+)
+```
+
+## 10.6 Residency status
+
+```{r obj4-residency}
+# The displayed analysis_ready_matrix does not contain a residency-status
+# variable. Search explicitly for plausible residency fields and do not
+# fabricate one.
+
+residency_candidates <- grep(
+  "resid|resident|migration|migrant|episode",
+  names(dat),
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+residency_candidates
+```
+
+```{r obj4-residency-analysis}
+if (length(residency_candidates) == 0) {
+
+  residency_status <- tibble(
+    analysis = "Residency status",
+    status = "NOT RUN",
+    reason = paste(
+      "No residency-status variable is present in the supplied",
+      "analysis_ready_matrix. The protocol requires residency status,",
+      "but it cannot be reconstructed from the displayed variables."
+    )
+  )
+
+} else {
+
+  residency_status <- tibble(
+    analysis = "Residency status",
+    status = "REQUIRES DATA-DICTIONARY VALIDATION",
+    candidate_variables = paste(residency_candidates, collapse = "; ")
+  )
+}
+
+residency_status %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  residency_status,
+  "Results/Subgroups/Residency_Status_Analysis_Status.csv",
+  row.names = FALSE
+)
+```
+
+# 11. Optional attributable mortality analysis
+
+Attributable fraction is a downstream analysis in the supplied project materials and is not relabelled as protocol Objective 1. It should only be run when the installed `FluMoDL` package and its `attrdl()` implementation are available and compatible with the fitted model.
+
+```{r attributable-fraction}
+if (requireNamespace("FluMoDL", quietly = TRUE) &&
+    "attrdl" %in% getNamespaceExports("FluMoDL")) {
+
+  af_heat <- tryCatch(
+    FluMoDL::attrdl(
+      x = dat[[EXPOSURE_VAR]],
+      basis = cb,
+      cases = dat[[OUTCOME_VAR]],
+      model = fit,
+      cen = MMT,
+      range = c(MMT, Inf),
+      type = "af"
+    ),
+    error = function(e) NA_real_
+  )
+
+  af_cold <- tryCatch(
+    FluMoDL::attrdl(
+      x = dat[[EXPOSURE_VAR]],
+      basis = cb,
+      cases = dat[[OUTCOME_VAR]],
+      model = fit,
+      cen = MMT,
+      range = c(-Inf, MMT),
+      type = "af"
+    ),
+    error = function(e) NA_real_
+  )
+
+  af_table <- tibble(
+    component = c("Cold below MMT", "Heat at/above MMT"),
+    attributable_fraction = c(af_cold, af_heat)
+  )
+
+} else {
+
+  af_table <- tibble(
+    component = c("Cold below MMT", "Heat at/above MMT"),
+    attributable_fraction = NA_real_,
+    status = "Not run: compatible FluMoDL::attrdl() unavailable"
+  )
+}
+
+af_table %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  af_table,
+  "Results/AttributableFraction/Attributable_Fraction.csv",
+  row.names = FALSE
+)
+```
+
+# 12. Diagnostic checks
+
+## 12.1 MMT support
+
+```{r diagnostics-mmt}
+mmt_support <- tibble(
+  P01 = quantile(dat[[EXPOSURE_VAR]], .01, na.rm = TRUE),
+  P05 = quantile(dat[[EXPOSURE_VAR]], .05, na.rm = TRUE),
+  MMT = MMT,
+  P95 = quantile(dat[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+  P99 = quantile(dat[[EXPOSURE_VAR]], .99, na.rm = TRUE),
+  MMT_in_P05_P95 = MMT >= quantile(dat[[EXPOSURE_VAR]], .05, na.rm = TRUE) &
+    MMT <= quantile(dat[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+  MMT_ge_25 = MMT >= params$mmt_min_plausible
+)
+
+mmt_support %>%
+  flextable::flextable() %>% flextable::autofit()
+```
+
+## 12.2 Candidate diagnostics plot
+
+```{r diagnostics-candidate-plot, fig.width=8, fig.height=6}
+ggplot(
+  diagnostics_tbl,
+  aes(
+    x = factor(lag_df),
+    y = factor(exposure_df),
+    fill = QAIC
+  )
+) +
+  geom_tile() +
+  facet_wrap(~ max_lag) +
+  labs(
+    x = "Lag df",
+    y = "Exposure df",
+    title = "Candidate QAIC"
+  )
+```
+
+# 13. Reproducibility decision log
+
+```{r decision-log}
+decision_log <- tibble(
+  decision = c(
+    "Design",
+    "Outcome",
+    "Exposure",
+    "Primary maximum lag",
+    "Exposure spline",
+    "Lag spline",
+    "MMT centering",
+    "MMT support range",
+    "Minimum plausible MMT",
+    "Maximum plausible RR",
+    "Kappa gate",
+    "Dispersion gate",
+    "Centre minimum deaths",
+    "Model-selection rule",
+    "Bootstrap/uncertainty approach"
+  ),
+  choice = c(
+    "Time-stratified case-crossover",
+    OUTCOME_VAR,
+    EXPOSURE_VAR,
+    paste0(best_spec$max_lag, " days"),
+    paste0("Natural spline, df=", best_spec$exposure_df),
+    paste0("Natural spline, df=", best_spec$lag_df),
+    paste0(round(MMT, 2), " °C UTCI"),
+    "5th–95th percentile of observed exposure",
+    paste0(">=", params$mmt_min_plausible, " °C UTCI"),
+    paste0("<=", params$max_rr_plausible),
+    paste0("<=", params$kappa_max),
+    paste0("<=", params$dispersion_max),
+    params$min_centre_deaths,
+    "Sequential diagnostic/plausibility gates followed by QAIC and parsimony",
+    paste0(
+      "Primary: coefficient-distribution Monte Carlo (",
+      params$mc_draws,
+      " draws); optional B=100–200 case/stratum bootstrap only as sensitivity"
+    )
+  )
+)
+
+decision_log %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  decision_log,
+  "Results/Objects/Decision_Log.csv",
+  row.names = FALSE
+)
+```
+
+# 14. Final publication-oriented summary
+
+```{r final-summary}
+final_summary <- tibble(
+  model = "Conditional quasi-Poisson DLNM using gnm eliminate=stratum",
+  exposure = EXPOSURE_VAR,
+  max_lag = best_spec$max_lag,
+  exposure_df = best_spec$exposure_df,
+  lag_df = best_spec$lag_df,
+  MMT = MMT,
+  centres_included = nrow(included_centres),
+  centres_excluded = nrow(centre_results) - nrow(included_centres),
+  total_deaths = sum(dat[[OUTCOME_VAR]] == 1, na.rm = TRUE),
+  MC_MMT_median = mmt_summary$median_MMT,
+  MC_MMT_low = mmt_summary$CI_low,
+  MC_MMT_high = mmt_summary$CI_high
+)
+
+final_summary %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  final_summary,
+  "Results/Meta/Final_Model_Summary.csv",
+  row.names = FALSE
+)
+
+officer::read_docx() %>%
+  officer::body_add_flextable(
+    flextable::flextable(final_summary)
+  ) %>%
+  print(
+    target = "Results/Meta/Final_Model_Summary.docx"
+  )
+```
+
+# 15. Session information
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  "Results/Objects/SessionInfo.txt"
+)
+
+sessionInfo()
+```
+
+# 16. Validation checklist
+
+```{r validation-checklist}
+validation <- tibble(
+  check = c(
+    "analysis_ready_matrix found",
+    "Required variables present",
+    "UTCI lag 0–21 present",
+    "Outcome coded 0/1",
+    "Primary model converged",
+    "Primary crossbasis full rank",
+    "MMT inside observed P05–P95",
+    "MMT >= 25°C",
+    "Maximum candidate RR gate satisfied",
+    "At least two centres passed QC",
+    "Pooled meta-analysis fitted",
+    "Objective 2 lag windows produced",
+    "Temporal period coverage verified",
+    "Residency variable available"
+  ),
+  result = c(
+    TRUE,
+    length(missing_required) == 0,
+    length(missing_lags) == 0,
+    all(dat[[OUTCOME_VAR]] %in% c(0,1,NA)),
+    isTRUE(best_fit$metrics$converged),
+    isTRUE(best_fit$metrics$full_rank),
+    MMT >= quantile(dat[[EXPOSURE_VAR]], .05, na.rm = TRUE) &&
+      MMT <= quantile(dat[[EXPOSURE_VAR]], .95, na.rm = TRUE),
+    MMT >= params$mmt_min_plausible,
+    best_fit$metrics$max_RR <= params$max_rr_plausible,
+    nrow(included_centres) >= 2,
+    exists("west_africa_model"),
+    nrow(lag_windows_tbl) > 0,
+    length(valid_periods) >= 1,
+    length(residency_candidates) > 0
+  )
+)
+
+validation %>%
+  flextable::flextable() %>% flextable::autofit()
+
+write.csv(
+  validation,
+  "Results/Diagnostics/Validation_Checklist.csv",
+  row.names = FALSE
+)
+```
+
+# 17. Interpretation guardrails
+
+- Report the primary DLNM specification actually selected by the data and diagnostic gates.
+- Do not describe an RR below 1 at a later lag as harvesting without examining the full lag pattern and cumulative association.
+- Do not infer causal adaptation solely from early/late period differences.
+- Do not label numeric sex codes until the data dictionary confirms their meaning.
+- Do not report a residency effect because the displayed matrix does not contain a residency-status variable.
+- Do not use the old 2009–2012 versus 2013–2016 example periods unless the actual dataset and protocol are explicitly revised to those years.
+- Do not use a 1,000+ full-data bootstrap as the default uncertainty engine.
+- Do not run large-scale parallel model fitting by default: worker processes can duplicate the 186,628-row matrix and substantially increase peak RAM.
+- If a genuine nonparametric bootstrap is required by peer review, use a small sequential sensitivity bootstrap, checkpoint every replicate, and store only compact outputs.
+

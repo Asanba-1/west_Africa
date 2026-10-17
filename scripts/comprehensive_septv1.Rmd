@@ -1,0 +1,4743 @@
+---
+title: "West Africa UTCI-Mortality: Gold-Standard Case-Crossover DLNM Analysis"
+subtitle: "Objectives 1–4 | Lag 7, Lag 14 and Lag 21 E3_L3 comparison"
+author: "Reproducible epidemiological analysis"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+
+output:
+  word_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    fig_caption: true
+
+params:
+  analysis_file: "mortality_health_analysis_readydata.rds"
+
+  candidate_lags:
+    - 7
+    - 14
+    - 21
+
+  exposure_df: 3
+  lag_df: 3
+
+  mc_draws: 10000
+
+  seed: 20260902
+
+  mmt_lower_quantile: 0.05
+  mmt_upper_quantile: 0.95
+
+  min_centre_deaths: 50
+  max_kappa: 500
+
+  # ---------------------------------------------------------
+  # PRIMARY LAG IS INTENTIONALLY NULL.
+  #
+  # Review:
+  #   1. cumulative RR comparison
+  #   2. lag-response curves
+  #   3. 3D surfaces
+  #   4. diagnostic table
+  #   5. lag 15–21 incremental effects
+  #
+  # Then manually select ONE:
+  #
+  # PRIMARY_LAG <- 7
+  # PRIMARY_LAG <- 14
+  # PRIMARY_LAG <- 21
+  #
+  # ---------------------------------------------------------
+  primary_lag: null
+---
+
+```{r setup, include=FALSE}
+
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "tibble",
+  "readr",
+  "ggplot2",
+  "lubridate",
+  "janitor",
+  "splines",
+  "dlnm",
+  "gnm",
+  "MASS",
+  "flextable",
+  "officer",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following packages are missing: ",
+    paste(missing_packages, collapse = ", "),
+    "\nInstall them before knitting."
+  )
+}
+
+invisible(
+  lapply(
+    required_packages,
+    library,
+    character.only = TRUE
+  )
+)
+
+set.seed(params$seed)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  results = "asis"
+)
+
+options(
+  dplyr.summarise.inform = FALSE,
+  scipen = 999
+)
+
+```
+
+
+```{r}
+
+output_dirs <- c(
+  "Results",
+  "Results/Descriptives",
+  "Results/Diagnostics",
+  "Results/Crossbasis",
+  "Results/LagComparison",
+  "Results/PrimaryModel",
+  "Results/Subgroups",
+  "Results/Figures",
+  "Results/Tables",
+  "Results/Objects",
+  "Results/Uncertainty"
+)
+
+invisible(
+  lapply(
+    output_dirs,
+    dir.create,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+)
+
+```
+
+
+
+
+
+```{r}
+
+
+analysis_file <- params$analysis_file
+
+if (!file.exists(analysis_file)) {
+
+  possible_files <- c(
+    "mortality_health_analysis_readydata.rds",
+    "mortality_health_analysis_readydata.csv",
+    "analysis_ready_matrix.rds"
+  )
+
+  found <- possible_files[file.exists(possible_files)]
+
+  if (length(found) == 0) {
+    stop(
+      "Could not find the processed analytical dataset.\n",
+      "Expected: ", analysis_file
+    )
+  }
+
+  analysis_file <- found[1]
+}
+
+if (grepl("\\.rds$", analysis_file, ignore.case = TRUE)) {
+
+  analysis_ready_matrix <- readRDS(analysis_file)
+
+} else if (grepl("\\.csv$", analysis_file, ignore.case = TRUE)) {
+
+  analysis_ready_matrix <- readr::read_csv(
+    analysis_file,
+    show_col_types = FALSE
+  )
+
+} else {
+
+  stop(
+    "Unsupported analytical data format: ",
+    analysis_file
+  )
+}
+
+analysis_ready_matrix <- as_tibble(analysis_ready_matrix)
+
+cat(
+  "Analytical dataset imported successfully.\n",
+  "Rows: ", nrow(analysis_ready_matrix), "\n",
+  "Columns: ", ncol(analysis_ready_matrix), "\n"
+)
+
+```
+
+
+5. Required-variable validation
+
+```{r}
+
+required_variables <- c(
+  "stratum_id",
+  "concat_individualid",
+  "centreid",
+  "centre_name",
+  "country",
+  "sex",
+  "age_at_death",
+  "age_group",
+  "date",
+  "year",
+  "month",
+  "dow",
+  "outcome",
+  "utci_mean",
+  "utci_lag0",
+  "utci_lag7",
+  "utci_lag14",
+  "utci_lag21"
+)
+
+missing_variables <- setdiff(
+  required_variables,
+  names(analysis_ready_matrix)
+)
+
+if (length(missing_variables) > 0) {
+
+  stop(
+    "The following required variables are missing:\n",
+    paste(missing_variables, collapse = ", ")
+  )
+
+}
+
+
+```
+
+
+
+
+6. Basic structural validation
+
+```{r}
+dat <- analysis_ready_matrix
+
+if (!inherits(dat$date, "Date")) {
+  dat$date <- as.Date(dat$date)
+}
+
+if (!all(dat$outcome %in% c(0, 1), na.rm = TRUE)) {
+  stop("`outcome` must be coded 0/1.")
+}
+
+if (anyDuplicated(
+  dat %>%
+    distinct(stratum_id, date)
+)) {
+
+  stop(
+    "Duplicate stratum_id/date combinations detected."
+  )
+
+}
+
+stratum_qc <- dat %>%
+  group_by(stratum_id) %>%
+  summarise(
+    n_rows = n(),
+    n_cases = sum(outcome == 1, na.rm = TRUE),
+    n_referents = sum(outcome == 0, na.rm = TRUE),
+    n_unique_dates = n_distinct(date),
+    .groups = "drop"
+  )
+
+bad_strata <- stratum_qc %>%
+  filter(
+    n_cases != 1 |
+    n_referents < 1 |
+    n_unique_dates != n_rows
+  )
+
+if (nrow(bad_strata) > 0) {
+
+  warning(
+    nrow(bad_strata),
+    " strata failed structural case-crossover checks."
+  )
+
+}
+
+```
+
+7. Analytical sample definition
+
+The longest candidate lag is 21 days. Therefore all three candidate models are evaluated on the same complete-case analytical population wherever possible.
+
+This avoids comparing models on different mortality strata.
+
+```{r}
+
+model_data <- dat %>%
+  filter(
+    !is.na(outcome),
+    !is.na(stratum_id),
+    !is.na(utci_lag0),
+    !is.na(utci_lag7),
+    !is.na(utci_lag14),
+    !is.na(utci_lag21)
+  ) %>%
+  arrange(stratum_id, date)
+
+if (nrow(model_data) == 0) {
+  stop("No observations remain after analytical exposure completeness filtering.")
+}
+
+if (n_distinct(model_data$stratum_id) < 10) {
+  stop("Fewer than 10 case-crossover strata remain.")
+}
+
+cat(
+  "Complete analytical dataset:\n",
+  "Rows = ", nrow(model_data), "\n",
+  "Strata = ", n_distinct(model_data$stratum_id), "\n",
+  "Deaths = ", sum(model_data$outcome == 1), "\n"
+)
+```
+
+
+8. Gold-standard descriptive epidemiology
+8.1 Overall analytical sample
+```{r}
+
+death_cases <- model_data %>%
+  filter(outcome == 1) %>%
+  distinct(stratum_id, .keep_all = TRUE)
+
+overall_summary <- tibble(
+  Measure = c(
+    "Analytical rows",
+    "Case-crossover strata",
+    "Deaths",
+    "Unique individuals",
+    "Centres",
+    "Countries",
+    "First death date",
+    "Last death date",
+    "Mean referents per case",
+    "Median referents per case"
+  ),
+
+  Value = c(
+    nrow(model_data),
+    n_distinct(model_data$stratum_id),
+    nrow(death_cases),
+    n_distinct(death_cases$concat_individualid),
+    n_distinct(death_cases$centreid),
+    n_distinct(death_cases$country),
+    as.character(min(death_cases$date, na.rm = TRUE)),
+    as.character(max(death_cases$date, na.rm = TRUE)),
+    round(mean(stratum_qc$n_referents, na.rm = TRUE), 2),
+    round(median(stratum_qc$n_referents, na.rm = TRUE), 2)
+  )
+)
+
+flextable(overall_summary) %>%
+  autofit()
+
+write_csv(
+  overall_summary,
+  "Results/Tables/Table_Overall_Analytical_Sample.csv"
+)
+
+```
+
+9. Mortality by country
+
+```{r}
+deaths_by_country <- death_cases %>%
+  count(country, name = "Deaths") %>%
+  mutate(
+    Percent = 100 * Deaths / sum(Deaths)
+  ) %>%
+  arrange(desc(Deaths))
+
+flextable(deaths_by_country) %>%
+  colformat_num(
+    j = "Percent",
+    digits = 1
+  ) %>%
+  autofit()
+
+write_csv(
+  deaths_by_country,
+  "Results/Tables/Table_Deaths_By_Country.csv"
+)
+
+```
+
+10. Mortality by centre
+```{r}
+
+deaths_by_centre <- death_cases %>%
+  count(
+    country,
+    centre_name,
+    name = "Deaths"
+  ) %>%
+  group_by(country) %>%
+  mutate(
+    Percent_within_country =
+      100 * Deaths / sum(Deaths)
+  ) %>%
+  ungroup()
+
+flextable(deaths_by_centre) %>%
+  colformat_num(
+    j = "Percent_within_country",
+    digits = 1
+  ) %>%
+  autofit()
+
+write_csv(
+  deaths_by_centre,
+  "Results/Tables/Table_Deaths_By_Centre.csv"
+)
+```
+
+
+11. Mortality by sex and age
+
+```{r}
+sex_summary <- death_cases %>%
+  count(sex, name = "Deaths") %>%
+  mutate(
+    Percent = 100 * Deaths / sum(Deaths)
+  )
+
+age_summary <- death_cases %>%
+  count(age_group, name = "Deaths") %>%
+  mutate(
+    Percent = 100 * Deaths / sum(Deaths)
+  )
+
+flextable(sex_summary) %>%
+  autofit()
+
+flextable(age_summary) %>%
+  autofit()
+
+write_csv(
+  sex_summary,
+  "Results/Tables/Table_Deaths_By_Sex.csv"
+)
+
+write_csv(
+  age_summary,
+  "Results/Tables/Table_Deaths_By_Age.csv"
+)
+
+```
+
+12. UTCI descriptive statistics
+```{r}
+
+utci_summary <- model_data %>%
+  summarise(
+    N = sum(!is.na(utci_lag0)),
+    Mean = mean(utci_lag0, na.rm = TRUE),
+    SD = sd(utci_lag0, na.rm = TRUE),
+    Min = min(utci_lag0, na.rm = TRUE),
+    P01 = quantile(utci_lag0, .01, na.rm = TRUE),
+    P05 = quantile(utci_lag0, .05, na.rm = TRUE),
+    Median = median(utci_lag0, na.rm = TRUE),
+    P95 = quantile(utci_lag0, .95, na.rm = TRUE),
+    P99 = quantile(utci_lag0, .99, na.rm = TRUE),
+    Max = max(utci_lag0, na.rm = TRUE)
+  )
+
+flextable(utci_summary) %>%
+  colformat_num(
+    digits = 2
+  ) %>%
+  autofit()
+
+write_csv(
+  utci_summary,
+  "Results/Tables/Table_UTCI_Overall_Summary.csv"
+)
+
+```
+
+13. UTCI summary by country
+
+```{r}
+utci_country <- model_data %>%
+  group_by(country) %>%
+  summarise(
+    N = sum(!is.na(utci_lag0)),
+    Mean = mean(utci_lag0, na.rm = TRUE),
+    SD = sd(utci_lag0, na.rm = TRUE),
+    P01 = quantile(utci_lag0, .01, na.rm = TRUE),
+    P05 = quantile(utci_lag0, .05, na.rm = TRUE),
+    Median = median(utci_lag0, na.rm = TRUE),
+    P95 = quantile(utci_lag0, .95, na.rm = TRUE),
+    P99 = quantile(utci_lag0, .99, na.rm = TRUE),
+    Min = min(utci_lag0, na.rm = TRUE),
+    Max = max(utci_lag0, na.rm = TRUE)
+  )
+
+flextable(utci_country) %>%
+  colformat_num(
+    columns = 3:ncol(utci_country),
+    digits = 2
+  ) %>%
+  autofit()
+
+write_csv(
+  utci_country,
+  "Results/Tables/Table_UTCI_By_Country.csv"
+)
+
+```
+
+14. Gold-standard UTCI time series
+
+For descriptive plotting, use one observation per centre-day, not the expanded case-crossover matrix. This prevents referent replication from artificially weighting some dates more heavily.
+
+```{r}
+
+exposure_site_day <- model_data %>%
+  distinct(
+    centreid,
+    centre_name,
+    country,
+    date,
+    utci_lag0
+  ) %>%
+  rename(
+    utci_mean = utci_lag0
+  ) %>%
+  arrange(centreid, date)
+```
+
+
+14.1 Overall exposure time series
+```{r}
+
+p_utci_overall <- ggplot(
+  exposure_site_day,
+  aes(
+    x = date,
+    y = utci_mean,
+    group = centreid
+  )
+) +
+  geom_line(
+    linewidth = 0.25,
+    alpha = 0.35
+  ) +
+  labs(
+    title = "Daily UTCI exposure across study centres",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  ) +
+  theme_minimal(
+    base_size = 12
+  )
+
+p_utci_overall
+
+ggsave(
+  "Results/Figures/Figure_01_Overall_UTCI_Time_Series.png",
+  p_utci_overall,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+14.2 UTCI time series by country
+
+```{r}
+country_daily <- exposure_site_day %>%
+  group_by(country, date) %>%
+  summarise(
+    utci_mean = mean(utci_mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_utci_country <- ggplot(
+  country_daily,
+  aes(
+    x = date,
+    y = utci_mean
+  )
+) +
+  geom_line(
+    linewidth = 0.35
+  ) +
+  facet_wrap(
+    ~ country,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Daily UTCI time series by country",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  ) +
+  theme_minimal(
+    base_size = 11
+  )
+
+p_utci_country
+
+ggsave(
+  "Results/Figures/Figure_02_UTCI_Time_Series_By_Country.png",
+  p_utci_country,
+  width = 12,
+  height = 9,
+  dpi = 300
+)
+```
+
+
+14.3 UTCI by centre
+
+```{r}
+p_utci_centre <- ggplot(
+  exposure_site_day,
+  aes(
+    x = date,
+    y = utci_mean
+  )
+) +
+  geom_line(
+    linewidth = 0.25
+  ) +
+  facet_wrap(
+    ~ centre_name,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Daily UTCI time series by study centre",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  ) +
+  theme_minimal(
+    base_size = 10
+  )
+
+p_utci_centre
+
+ggsave(
+  "Results/Figures/Figure_03_UTCI_Time_Series_By_Centre.png",
+  p_utci_centre,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+
+```
+
+15. UTCI distribution
+
+```{r}
+p_utci_distribution <- ggplot(
+  exposure_site_day,
+  aes(x = utci_mean)
+) +
+  geom_histogram(
+    bins = 60
+  ) +
+  labs(
+    title = "Distribution of daily UTCI",
+    x = "Mean UTCI (°C)",
+    y = "Centre-days"
+  ) +
+  theme_minimal(
+    base_size = 12
+  )
+
+p_utci_distribution
+
+ggsave(
+  "Results/Figures/Figure_04_UTCI_Distribution.png",
+  p_utci_distribution,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+```
+
+16. UTCI distribution by country
+
+```{r}
+p_utci_country_box <- ggplot(
+  exposure_site_day,
+  aes(
+    x = country,
+    y = utci_mean
+  )
+) +
+  geom_boxplot(
+    outlier.alpha = 0.15
+  ) +
+  labs(
+    title = "Distribution of daily UTCI by country",
+    x = NULL,
+    y = "Mean UTCI (°C)"
+  ) +
+  theme_minimal(
+    base_size = 12
+  ) +
+  theme(
+    axis.text.x =
+      element_text(
+        angle = 35,
+        hjust = 1
+      )
+  )
+
+p_utci_country_box
+
+ggsave(
+  "Results/Figures/Figure_05_UTCI_Distribution_By_Country.png",
+  p_utci_country_box,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+```
+
+17. Case-day versus referent-day UTCI
+
+```{r}
+
+case_referent_utci <- model_data %>%
+  group_by(stratum_id) %>%
+  summarise(
+    case_utci =
+      utci_lag0[outcome == 1][1],
+
+    mean_referent_utci =
+      mean(
+        utci_lag0[outcome == 0],
+        na.rm = TRUE
+      ),
+
+    contrast =
+      case_utci -
+      mean_referent_utci
+  )
+
+case_referent_summary <- case_referent_utci %>%
+  summarise(
+    N = n(),
+    Mean_case_UTCI =
+      mean(case_utci, na.rm = TRUE),
+    Mean_referent_UTCI =
+      mean(mean_referent_utci, na.rm = TRUE),
+    Mean_contrast =
+      mean(contrast, na.rm = TRUE),
+    Median_contrast =
+      median(contrast, na.rm = TRUE),
+    P05_contrast =
+      quantile(contrast, .05, na.rm = TRUE),
+    P95_contrast =
+      quantile(contrast, .95, na.rm = TRUE)
+  )
+
+flextable(case_referent_summary) %>%
+  colformat_num(digits = 2) %>%
+  autofit()
+
+write_csv(
+  case_referent_summary,
+  "Results/Tables/Table_Case_Referent_UTCI_Contrast.csv"
+)
+```
+
+
+
+```{r}
+
+```
+
+
+
+
+
+18. IMPORTANT: robust DLNM coefficient extraction
+
+This section specifically fixes the error you encountered.
+
+Your diagnostic showed:
+
+crossbasis:
+v1.l1 ... v5.l4
+
+gnm:
+cbv1.l1 ... cbv5.l4
+
+Thus the 20 coefficients are present and correct, but their names contain the cb prefix added by the model formula.
+
+We therefore do not ask crosspred() to discover them automatically from the gnm object.
+
+Instead:
+
+identify all crossbasis columns;
+identify corresponding gnm coefficients;
+remove the cb prefix;
+reorder them exactly as the crossbasis;
+reorder vcov;
+pass coef and vcov explicitly.
+
+```{r}
+extract_crossbasis_parameters <- function(
+    cb,
+    fit,
+    prefix = "cb"
+) {
+
+  cb_names <- colnames(cb)
+
+  if (is.null(cb_names)) {
+    stop("Crossbasis has no column names.")
+  }
+
+  model_coef <- stats::coef(fit)
+  model_names <- names(model_coef)
+
+  expected_model_names <-
+    paste0(prefix, cb_names)
+
+  missing_coef <- setdiff(
+    expected_model_names,
+    model_names
+  )
+
+  if (length(missing_coef) > 0) {
+
+    stop(
+      "The fitted model does not contain all expected crossbasis ",
+      "coefficients.\nMissing:\n",
+      paste(missing_coef, collapse = "\n")
+    )
+
+  }
+
+  beta <- model_coef[
+    expected_model_names
+  ]
+
+  names(beta) <- cb_names
+
+  V <- stats::vcov(fit)
+
+  if (is.null(rownames(V)) ||
+      is.null(colnames(V))) {
+
+    stop(
+      "Model variance-covariance matrix has no coefficient names."
+    )
+
+  }
+
+  V_cb <- V[
+    expected_model_names,
+    expected_model_names,
+    drop = FALSE
+  ]
+
+  rownames(V_cb) <- cb_names
+  colnames(V_cb) <- cb_names
+
+  if (length(beta) != ncol(cb)) {
+
+    stop(
+      "Crossbasis coefficient length mismatch: ",
+      length(beta),
+      " coefficients for ",
+      ncol(cb),
+      " crossbasis columns."
+    )
+
+  }
+
+  if (!identical(names(beta), cb_names)) {
+
+    stop(
+      "Crossbasis coefficient ordering is not identical to basis ordering."
+    )
+
+  }
+
+  if (!isTRUE(all.equal(
+    rownames(V_cb),
+    cb_names
+  ))) {
+
+    stop(
+      "Variance-covariance row ordering does not match crossbasis."
+    )
+
+  }
+
+  if (any(!is.finite(beta))) {
+    stop("Non-finite crossbasis coefficients detected.")
+  }
+
+  if (any(!is.finite(V_cb))) {
+    stop("Non-finite crossbasis variance-covariance elements detected.")
+  }
+
+  list(
+    coef = beta,
+    vcov = V_cb,
+    basis_names = cb_names
+  )
+}
+
+```
+
+19. Safe crosspred() function
+
+```{r}
+safe_crosspred <- function(
+    cb,
+    fit,
+    cen,
+    by = 0.1,
+    cumul = TRUE
+) {
+
+  pars <- extract_crossbasis_parameters(
+    cb = cb,
+    fit = fit
+  )
+
+  pred <- tryCatch(
+
+    dlnm::crosspred(
+      cb,
+      coef = pars$coef,
+      vcov = pars$vcov,
+      model.link = "log",
+      cen = cen,
+      by = by,
+      cumul = cumul
+    ),
+
+    error = function(e) {
+
+      stop(
+        "Safe crosspred failed.\n",
+        "Error: ",
+        conditionMessage(e)
+      )
+
+    }
+  )
+
+  pred
+}
+
+```
+
+20. Diagnostic function for every fitted DLNM
+```{r}
+
+diagnose_dlnm_fit <- function(
+    cb,
+    fit,
+    label = "model"
+) {
+
+  cb_names <- colnames(cb)
+  coef_names <- names(stats::coef(fit))
+  V <- stats::vcov(fit)
+
+  expected_names <- paste0(
+    "cb",
+    cb_names
+  )
+
+  list(
+    model = label,
+
+    crossbasis_columns =
+      ncol(cb),
+
+    model_coefficients =
+      length(stats::coef(fit)),
+
+    exact_expected_coefficients =
+      all(
+        expected_names %in% coef_names
+      ),
+
+    coefficient_length_match =
+      length(
+        stats::coef(fit)[expected_names]
+      ) == ncol(cb),
+
+    vcov_length_match =
+      all(
+        expected_names %in%
+          rownames(V)
+      ),
+
+    finite_coefficients =
+      all(
+        is.finite(
+          stats::coef(fit)[expected_names]
+        )
+      ),
+
+    finite_vcov =
+      all(
+        is.finite(
+          V[
+            expected_names,
+            expected_names,
+            drop = FALSE
+          ]
+        )
+      ),
+
+    crossbasis_rank =
+      qr(cb)$rank,
+
+    crossbasis_full_rank =
+      qr(cb)$rank == ncol(cb)
+  )
+}
+
+```
+
+21. DLNM model-fitting function
+
+```{r}
+run_dlnm_spec <- function(
+    dat,
+    max_lag,
+    exposure_df = 3L,
+    lag_df = 3L
+) {
+
+  required_lag <- paste0(
+    "utci_lag",
+    max_lag
+  )
+
+  if (!required_lag %in% names(dat)) {
+
+    stop(
+      "Required lag variable missing: ",
+      required_lag
+    )
+
+  }
+
+  d <- dat %>%
+    filter(
+      !is.na(outcome),
+      !is.na(stratum_id),
+      !is.na(utci_lag0),
+      !is.na(.data[[required_lag]])
+    ) %>%
+    arrange(
+      stratum_id,
+      date
+    )
+
+  if (n_distinct(d$stratum_id) < 10) {
+    return(NULL)
+  }
+
+  cb <- dlnm::crossbasis(
+
+    d$utci_lag0,
+
+    lag = max_lag,
+
+    argvar = list(
+      fun = "ns",
+      df = exposure_df
+    ),
+
+    arglag = list(
+      fun = "ns",
+      df = lag_df
+    )
+  )
+
+  fit <- tryCatch(
+
+    gnm::gnm(
+
+      outcome ~ cb,
+
+      eliminate =
+        factor(stratum_id),
+
+      family =
+        quasipoisson(),
+
+      data = d,
+
+      trace = FALSE
+    ),
+
+    error = function(e) {
+
+      attr(
+        NULL,
+        "error"
+      ) <- conditionMessage(e)
+
+      NULL
+
+    }
+  )
+
+  if (is.null(fit)) {
+    return(NULL)
+  }
+
+  pars <- extract_crossbasis_parameters(
+    cb = cb,
+    fit = fit
+  )
+
+  dispersion <- tryCatch(
+    summary(fit)$dispersion,
+    error = function(e)
+      NA_real_
+  )
+
+  convergence <- tryCatch(
+    isTRUE(fit$converged),
+    error = function(e)
+      TRUE
+  )
+
+  kappa_value <- tryCatch(
+
+    kappa(
+      pars$vcov
+    ),
+
+    error = function(e)
+      NA_real_
+  )
+
+  list(
+
+    fit = fit,
+
+    cb = cb,
+
+    data = d,
+
+    coef_cb = pars$coef,
+
+    vcov_cb = pars$vcov,
+
+    max_lag = max_lag,
+
+    exposure_df = exposure_df,
+
+    lag_df = lag_df,
+
+    dispersion = dispersion,
+
+    converged = convergence,
+
+    kappa = kappa_value
+
+  )
+}
+```
+
+
+22. QAIC function
+
+Because the model is quasi-Poisson, ordinary likelihood AIC should not be reported as though the model were Poisson likelihood based.
+
+```{r}
+
+qaic_deviance <- function(fit) {
+
+  dev <- tryCatch(
+    deviance(fit),
+    error = function(e)
+      NA_real_
+  )
+
+  phi <- tryCatch(
+    summary(fit)$dispersion,
+    error = function(e)
+      NA_real_
+  )
+
+  k <- length(
+    coef(fit)
+  )
+
+  if (
+    !is.finite(dev) ||
+    !is.finite(phi) ||
+    phi <= 0
+  ) {
+    return(NA_real_)
+  }
+
+  dev / phi + 2 * k
+}
+
+```
+
+23. Fit the three prespecified E3_L3 models
+
+```{r}
+fit_lag7_e3_l3 <- run_dlnm_spec(
+  model_data,
+  max_lag = 7,
+  exposure_df = 3,
+  lag_df = 3
+)
+
+fit_lag14_e3_l3 <- run_dlnm_spec(
+  model_data,
+  max_lag = 14,
+  exposure_df = 3,
+  lag_df = 3
+)
+
+fit_lag21_e3_l3 <- run_dlnm_spec(
+  model_data,
+  max_lag = 21,
+  exposure_df = 3,
+  lag_df = 3
+)
+
+fits <- list(
+  Lag7_E3_L3 = fit_lag7_e3_l3,
+  Lag14_E3_L3 = fit_lag14_e3_l3,
+  Lag21_E3_L3 = fit_lag21_e3_l3
+)
+
+if (any(vapply(fits, is.null, logical(1)))) {
+
+  failed_models <- names(
+    fits
+  )[
+    vapply(
+      fits,
+      is.null,
+      logical(1)
+    )
+  ]
+
+  stop(
+    "The following candidate models failed: ",
+    paste(
+      failed_models,
+      collapse = ", "
+    )
+  )
+
+}
+
+```
+
+24. Candidate-model diagnostic table
+
+
+# 24. Candidate-model diagnostic table
+
+```{r}
+candidate_diagnostics <- purrr::imap_dfr(
+
+  fits,
+
+  function(obj, id) {
+
+    # Wrap obj$cb in na.omit() to prevent qr.default() from crashing on NA values
+    diag <- diagnose_dlnm_fit(
+      na.omit(obj$cb),
+      obj$fit,
+      id
+    )
+
+    tibble(
+
+      model_id = id,
+
+      max_lag = obj$max_lag,
+
+      exposure_df = obj$exposure_df,
+
+      lag_df = obj$lag_df,
+
+      converged =
+        obj$converged,
+
+      dispersion =
+        obj$dispersion,
+
+      QAIC =
+        qaic_deviance(obj$fit),
+
+      kappa =
+        obj$kappa,
+
+      crossbasis_columns =
+        diag$crossbasis_columns,
+
+      crossbasis_rank =
+        diag$crossbasis_rank,
+
+      crossbasis_full_rank =
+        diag$crossbasis_full_rank,
+
+      coefficients_match =
+        diag$exact_expected_coefficients,
+
+      vcov_match =
+        diag$vcov_length_match,
+
+      coefficients_finite =
+        diag$finite_coefficients,
+
+      vcov_finite =
+        diag$finite_vcov
+
+    )
+  }
+)
+
+flextable(candidate_diagnostics) %>%
+  autofit()
+
+write_csv(
+  candidate_diagnostics,
+  "Results/Crossbasis/Candidate_Model_Diagnostics.csv"
+)
+```
+
+
+
+
+
+25. Verify safe crosspred() before proceeding
+
+This is the critical repair for the previous error.
+```{r}
+
+
+prediction_test <- purrr::imap(
+
+  fits,
+
+  function(obj, id) {
+
+    cen_test <- median(
+      obj$data$utci_lag0,
+      na.rm = TRUE
+    )
+
+    pred <- safe_crosspred(
+      cb = obj$cb,
+      fit = obj$fit,
+      cen = cen_test,
+      by = 0.1,
+      cumul = TRUE
+    )
+
+    list(
+      model_id = id,
+      prediction = pred,
+      cen = cen_test
+    )
+  }
+)
+
+prediction_validation <- tibble(
+
+  model_id =
+    names(prediction_test),
+
+  crosspred_success =
+    vapply(
+      prediction_test,
+      function(x)
+        inherits(
+          x$prediction,
+          "crosspred"
+        ),
+      logical(1)
+    )
+
+)
+
+flextable(prediction_validation) %>%
+  autofit()
+
+if (!all(prediction_validation$crosspred_success)) {
+
+  stop(
+    "At least one model failed the repaired crosspred compatibility test."
+  )
+
+}
+
+
+
+```
+
+
+26. Save the candidate models
+
+```{r}
+saveRDS(
+  fit_lag7_e3_l3,
+  "Results/Objects/model_Lag7_E3_L3.rds"
+)
+
+saveRDS(
+  fit_lag14_e3_l3,
+  "Results/Objects/model_Lag14_E3_L3.rds"
+)
+
+saveRDS(
+  fit_lag21_e3_l3,
+  "Results/Objects/model_Lag21_E3_L3.rds"
+)
+```
+
+27. Common centering value
+
+For direct comparison of the three candidate lag structures, use the same centering value.
+
+Here the centering value is the empirical median UTCI unless the user subsequently specifies another scientifically justified centering strategy.
+
+```{r}
+
+COMMON_CEN <- median(
+  model_data$utci_lag0,
+  na.rm = TRUE
+)
+
+COMMON_CEN
+```
+
+
+28. Generate predictions for all three candidate lags
+
+```{r}
+pred_lag7 <- safe_crosspred(
+  fit_lag7_e3_l3$cb,
+  fit_lag7_e3_l3$fit,
+  cen = COMMON_CEN,
+  by = 0.1,
+  cumul = TRUE
+)
+
+pred_lag14 <- safe_crosspred(
+  fit_lag14_e3_l3$cb,
+  fit_lag14_e3_l3$fit,
+  cen = COMMON_CEN,
+  by = 0.1,
+  cumul = TRUE
+)
+
+pred_lag21 <- safe_crosspred(
+  fit_lag21_e3_l3$cb,
+  fit_lag21_e3_l3$fit,
+  cen = COMMON_CEN,
+  by = 0.1,
+  cumul = TRUE
+)
+
+```
+
+29. Cumulative RR comparison: Lag 7 vs Lag 14 vs Lag 21
+
+This is one of the main decision figures.
+
+```{r}
+# ============================================================
+# 29. CUMULATIVE RR COMPARISON
+#     LAG 7 vs LAG 14 vs LAG 21
+#     ALL USING E3_L3
+# ============================================================
+
+# ------------------------------------------------------------
+# Purpose
+# ------------------------------------------------------------
+# Compare the cumulative UTCI-mortality association across
+# the three prespecified lag structures:
+#
+#   Lag 7  : E3_L3
+#   Lag 14 : E3_L3
+#   Lag 21 : E3_L3
+#
+# IMPORTANT:
+# dlnm::crosspred(..., cumul = TRUE) returns cumulative
+# estimates across individual lag points.
+#
+# Therefore:
+#
+#   pred$cumRRfit
+#
+# is typically a matrix with:
+#
+#   rows    = exposure values
+#   columns = cumulative lag points
+#
+# The final column represents the cumulative association
+# through the maximum lag.
+#
+# This section therefore extracts ONLY the final cumulative
+# RR through lag 7, lag 14, and lag 21 respectively.
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 29.1 Diagnostic function for cumulative prediction objects
+# ------------------------------------------------------------
+
+diagnose_cumulative_prediction <- function(pred, label) {
+
+  cat("\n====================================================\n")
+  cat("CUMULATIVE PREDICTION CHECK:", label, "\n")
+  cat("====================================================\n")
+
+  cat("Length predvar:",
+      length(pred$predvar), "\n")
+
+  cat("Dimensions cumRRfit:")
+
+  print(dim(pred$cumRRfit))
+
+  cat("Dimensions cumRRlow:")
+
+  print(dim(pred$cumRRlow))
+
+  cat("Dimensions cumRRhigh:")
+
+  print(dim(pred$cumRRhigh))
+
+  if (is.matrix(pred$cumRRfit)) {
+
+    cat(
+      "Number of exposure values:",
+      nrow(pred$cumRRfit),
+      "\n"
+    )
+
+    cat(
+      "Number of cumulative lag points:",
+      ncol(pred$cumRRfit),
+      "\n"
+    )
+
+  } else {
+
+    cat(
+      "cumRRfit is not a matrix.\n"
+    )
+
+  }
+
+  cat("====================================================\n")
+}
+
+
+# Run diagnostics before extraction
+
+diagnose_cumulative_prediction(
+  pred_lag7,
+  "Lag 7 E3_L3"
+)
+
+diagnose_cumulative_prediction(
+  pred_lag14,
+  "Lag 14 E3_L3"
+)
+
+diagnose_cumulative_prediction(
+  pred_lag21,
+  "Lag 21 E3_L3"
+)
+
+
+# ------------------------------------------------------------
+# 29.2 Robust extraction function
+# ------------------------------------------------------------
+
+extract_final_cumulative_rr <- function(
+    pred,
+    label,
+    max_lag
+) {
+
+  exposure <- as.numeric(pred$predvar)
+
+  rr <- pred$cumRRfit
+  low <- pred$cumRRlow
+  high <- pred$cumRRhigh
+
+
+  # ----------------------------------------------------------
+  # Handle matrix output from crosspred()
+  # ----------------------------------------------------------
+
+  if (is.matrix(rr)) {
+
+    # Final column = cumulative association through
+    # the maximum lag represented in the prediction object.
+
+    rr_final <- rr[, ncol(rr)]
+
+    low_final <- low[, ncol(low)]
+
+    high_final <- high[, ncol(high)]
+
+  } else {
+
+    # Fallback in case crosspred returns vectors
+
+    rr_final <- as.numeric(rr)
+
+    low_final <- as.numeric(low)
+
+    high_final <- as.numeric(high)
+
+  }
+
+
+  # ----------------------------------------------------------
+  # Strict dimensional validation
+  # ----------------------------------------------------------
+
+  if (
+    length(exposure) != length(rr_final) ||
+    length(exposure) != length(low_final) ||
+    length(exposure) != length(high_final)
+  ) {
+
+    stop(
+      "\nCumulative RR extraction failed for ",
+      label,
+      ".\n",
+      "Exposure length = ", length(exposure), "\n",
+      "RR length = ", length(rr_final), "\n",
+      "Lower CI length = ", length(low_final), "\n",
+      "Upper CI length = ", length(high_final), "\n",
+      "Check the crosspred object before proceeding."
+    )
+
+  }
+
+
+  # ----------------------------------------------------------
+  # Return clean long-format data
+  # ----------------------------------------------------------
+
+  tibble(
+    exposure = exposure,
+    RR = as.numeric(rr_final),
+    low = as.numeric(low_final),
+    high = as.numeric(high_final),
+    max_lag = max_lag,
+    model = label
+  )
+}
+
+
+# ------------------------------------------------------------
+# 29.3 Extract the three cumulative curves
+# ------------------------------------------------------------
+
+cum_rr_lag7 <- extract_final_cumulative_rr(
+  pred = pred_lag7,
+  label = "Lag 7 E3_L3",
+  max_lag = 7
+)
+
+
+cum_rr_lag14 <- extract_final_cumulative_rr(
+  pred = pred_lag14,
+  label = "Lag 14 E3_L3",
+  max_lag = 14
+)
+
+
+cum_rr_lag21 <- extract_final_cumulative_rr(
+  pred = pred_lag21,
+  label = "Lag 21 E3_L3",
+  max_lag = 21
+)
+
+
+# ------------------------------------------------------------
+# 29.4 Combine
+# ------------------------------------------------------------
+
+cum_rr <- bind_rows(
+  cum_rr_lag7,
+  cum_rr_lag14,
+  cum_rr_lag21
+)
+
+
+# ------------------------------------------------------------
+# 29.5 Final validation
+# ------------------------------------------------------------
+
+stopifnot(
+  nrow(cum_rr_lag7) > 0,
+  nrow(cum_rr_lag14) > 0,
+  nrow(cum_rr_lag21) > 0
+)
+
+stopifnot(
+  all(
+    is.finite(cum_rr$exposure) |
+      is.na(cum_rr$exposure)
+  )
+)
+
+stopifnot(
+  all(
+    is.finite(cum_rr$RR) |
+      is.na(cum_rr$RR)
+  )
+)
+
+stopifnot(
+  all(
+    is.finite(cum_rr$low) |
+      is.na(cum_rr$low)
+  )
+)
+
+stopifnot(
+  all(
+    is.finite(cum_rr$high) |
+      is.na(cum_rr$high)
+  )
+)
+
+
+# ------------------------------------------------------------
+# 29.6 Check number of observations per curve
+# ------------------------------------------------------------
+
+cum_rr %>%
+  group_by(model, max_lag) %>%
+  summarise(
+    n_exposure = n(),
+    exposure_min = min(exposure, na.rm = TRUE),
+    exposure_max = max(exposure, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print()
+
+
+# ------------------------------------------------------------
+# 29.7 Plot cumulative RR curves
+# ------------------------------------------------------------
+
+p_cumulative_rr <- ggplot(
+  cum_rr,
+  aes(
+    x = exposure,
+    y = RR,
+    linetype = model
+  )
+) +
+
+  geom_hline(
+    yintercept = 1,
+    linewidth = 0.4
+  ) +
+
+  geom_ribbon(
+    aes(
+      ymin = low,
+      ymax = high,
+      group = model
+    ),
+    alpha = 0.10,
+    colour = NA
+  ) +
+
+  geom_line(
+    linewidth = 0.9
+  ) +
+
+  labs(
+    title =
+      "Cumulative UTCI–mortality relative risk",
+
+    subtitle =
+      "Comparison of prespecified E3_L3 lag structures",
+
+    x =
+      "Mean UTCI (°C)",
+
+    y =
+      "Cumulative relative risk",
+
+    linetype =
+      "Maximum lag"
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  )
+
+
+p_cumulative_rr
+
+
+# ------------------------------------------------------------
+# 29.8 Save figure
+# ------------------------------------------------------------
+
+dir.create(
+  "Results/LagComparison",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+
+ggsave(
+  filename =
+    "Results/LagComparison/Figure_Cumulative_RR_Lag7_Lag14_Lag21_E3_L3.png",
+
+  plot =
+    p_cumulative_rr,
+
+  width = 11,
+  height = 7,
+  dpi = 300
+)
+
+
+# ------------------------------------------------------------
+# 29.9 Save analytical dataset
+# ------------------------------------------------------------
+
+write_csv(
+  cum_rr,
+  "Results/LagComparison/Cumulative_RR_Lag7_Lag14_Lag21_E3_L3.csv"
+)
+
+
+saveRDS(
+  cum_rr,
+  "Results/LagComparison/Cumulative_RR_Lag7_Lag14_Lag21_E3_L3.rds"
+)
+
+
+# ------------------------------------------------------------
+# 29.10 Display the final cumulative RR values at selected
+#       exposure percentiles
+# ------------------------------------------------------------
+
+cum_rr_summary <- cum_rr %>%
+
+  group_by(model, max_lag) %>%
+
+  summarise(
+
+    minimum_exposure =
+      min(exposure, na.rm = TRUE),
+
+    median_exposure =
+      median(exposure, na.rm = TRUE),
+
+    maximum_exposure =
+      max(exposure, na.rm = TRUE),
+
+    minimum_RR =
+      min(RR, na.rm = TRUE),
+
+    maximum_RR =
+      max(RR, na.rm = TRUE),
+
+    .groups = "drop"
+
+  )
+
+
+cum_rr_summary
+
+
+write_csv(
+  cum_rr_summary,
+  "Results/LagComparison/Cumulative_RR_Summary_Lag7_Lag14_Lag21_E3_L3.csv"
+)
+```
+
+30. Lag-response curves
+
+The values are snapped to the actual prediction grid to avoid the floating-point issue encountered previously.
+
+```{r}
+
+nearest_prediction_value <- function(
+    pred,
+    value
+) {
+
+  pred$predvar[
+    which.min(
+      abs(
+        pred$predvar -
+          value
+      )
+    )
+  ]
+}
+
+plot_lag_response_safe <- function(
+    pred,
+    at,
+    title
+) {
+
+  at_use <-
+    nearest_prediction_value(
+      pred,
+      at
+    )
+
+  dlnm::plot.crosspred(
+    pred,
+    "slices",
+    var = at_use,
+    ci = "lines",
+    xlab = "Lag (days)",
+    ylab = "Relative risk",
+    main =
+      paste0(
+        title,
+        "\nUTCI = ",
+        round(at_use, 1),
+        " °C"
+      )
+  )
+}
+
+```
+
+31. Lag-response comparison
+```{r}
+
+moderate_heat <- COMMON_CEN + 5
+extreme_heat <- COMMON_CEN + 8
+cold_value <- COMMON_CEN - 5
+
+png(
+  "Results/LagComparison/Figure_Lag_Response_Comparison.png",
+  width = 1800,
+  height = 1800,
+  res = 250
+)
+
+par(
+  mfrow = c(3, 3),
+  mar = c(4, 4, 3, 1)
+)
+
+plot_lag_response_safe(
+  pred_lag7,
+  moderate_heat,
+  "Lag 7: moderate heat"
+)
+
+plot_lag_response_safe(
+  pred_lag14,
+  moderate_heat,
+  "Lag 14: moderate heat"
+)
+
+plot_lag_response_safe(
+  pred_lag21,
+  moderate_heat,
+  "Lag 21: moderate heat"
+)
+
+plot_lag_response_safe(
+  pred_lag7,
+  extreme_heat,
+  "Lag 7: extreme heat"
+)
+
+plot_lag_response_safe(
+  pred_lag14,
+  extreme_heat,
+  "Lag 14: extreme heat"
+)
+
+plot_lag_response_safe(
+  pred_lag21,
+  extreme_heat,
+  "Lag 21: extreme heat"
+)
+
+plot_lag_response_safe(
+  pred_lag7,
+  cold_value,
+  "Lag 7: cold"
+)
+
+plot_lag_response_safe(
+  pred_lag14,
+  cold_value,
+  "Lag 14: cold"
+)
+
+plot_lag_response_safe(
+  pred_lag21,
+  cold_value,
+  "Lag 21: cold"
+)
+
+dev.off()
+
+```
+
+32. Three-dimensional exposure-lag-response surfaces
+```{r}
+#Lag 7
+
+png(
+  "Results/LagComparison/Figure_3D_Lag7_E3_L3.png",
+  width = 1800,
+  height = 1400,
+  res = 250
+)
+
+plot(
+  pred_lag7,
+  theta = 220,
+  phi = 35,
+  shade = 0.4,
+  xlab = "UTCI (°C)",
+  ylab = "Lag (days)",
+  zlab = "RR",
+  main = "Exposure-lag-response surface: Lag 7 E3_L3"
+)
+
+dev.off()
+
+plot(
+  pred_lag7,
+  theta = 220,
+  phi = 35,
+  shade = 0.4,
+  xlab = "UTCI (°C)",
+  ylab = "Lag (days)",
+  zlab = "RR",
+  main = "Lag 7 E3_L3"
+)
+```
+
+
+33. Lag 14 3D surface
+
+```{r}
+png(
+  "Results/LagComparison/Figure_3D_Lag14_E3_L3.png",
+  width = 1800,
+  height = 1400,
+  res = 250
+)
+
+plot(
+  pred_lag14,
+  theta = 220,
+  phi = 35,
+  shade = 0.4,
+  xlab = "UTCI (°C)",
+  ylab = "Lag (days)",
+  zlab = "RR",
+  main = "Exposure-lag-response surface: Lag 14 E3_L3"
+)
+
+dev.off()
+
+plot(
+  pred_lag14,
+  theta = 220,
+  phi = 35,
+  shade = 0.4,
+  xlab = "UTCI (°C)",
+  ylab = "Lag (days)",
+  zlab = "RR",
+  main = "Lag 14 E3_L3"
+)
+```
+
+
+34. Lag 21 3D surface
+```{r}
+
+png(
+  "Results/LagComparison/Figure_3D_Lag21_E3_L3.png",
+  width = 1800,
+  height = 1400,
+  res = 250
+)
+
+plot(
+  pred_lag21,
+  theta = 220,
+  phi = 35,
+  shade = 0.4,
+  xlab = "UTCI (°C)",
+  ylab = "Lag (days)",
+  zlab = "RR",
+  main = "Exposure-lag-response surface: Lag 21 E3_L3"
+)
+
+dev.off()
+
+plot(
+  pred_lag21,
+  theta = 220,
+  phi = 35,
+  shade = 0.4,
+  xlab = "UTCI (°C)",
+  ylab = "Lag (days)",
+  zlab = "RR",
+  main = "Lag 21 E3_L3"
+)
+
+```
+
+35. Lag-specific effects and harvesting assessment
+
+The cumulative effect over a lag window is calculated as the exponential of the sum of the lag-specific log-relative-risks.
+```{r}
+
+
+summarise_lag_windows <- function(
+    pred,
+    at,
+    max_lag,
+    label
+) {
+
+  at_use <-
+    nearest_prediction_value(
+      pred,
+      at
+    )
+
+  exposure_index <-
+    which(
+      pred$predvar ==
+        at_use
+    )
+
+  log_rr <-
+    log(
+      pred$matRRfit[
+        exposure_index,
+        1:(max_lag + 1)
+      ]
+    )
+
+  lag_days <-
+    0:max_lag
+
+  windows <- list(
+
+    Immediate =
+      c(0, 0),
+
+    Short =
+      c(1, min(3, max_lag)),
+
+    Medium =
+      c(4, min(7, max_lag)),
+
+    Delayed =
+      c(8, min(14, max_lag)),
+
+    Harvesting =
+      c(min(15, max_lag), max_lag)
+
+  )
+
+  purrr::imap_dfr(
+
+    windows,
+
+    function(rng, window_name) {
+
+      if (rng[1] > rng[2]) {
+        return(NULL)
+      }
+
+      selected <-
+        lag_days >= rng[1] &
+        lag_days <= rng[2]
+
+      tibble(
+
+        exposure_condition = label,
+
+        window = window_name,
+
+        lag_range =
+          paste0(
+            rng[1],
+            "–",
+            rng[2]
+          ),
+
+        cumulative_RR =
+          exp(
+            sum(
+              log_rr[selected],
+              na.rm = TRUE
+            )
+          )
+
+      )
+    }
+  )
+}
+
+```
+
+36. Lag-window comparison
+
+```{r}
+lag_window_results <- bind_rows(
+
+  summarise_lag_windows(
+    pred_lag7,
+    moderate_heat,
+    7,
+    "Moderate heat"
+  ) %>%
+    mutate(model = "Lag 7 E3_L3"),
+
+  summarise_lag_windows(
+    pred_lag14,
+    moderate_heat,
+    14,
+    "Moderate heat"
+  ) %>%
+    mutate(model = "Lag 14 E3_L3"),
+
+  summarise_lag_windows(
+    pred_lag21,
+    moderate_heat,
+    21,
+    "Moderate heat"
+  ) %>%
+    mutate(model = "Lag 21 E3_L3"),
+
+  summarise_lag_windows(
+    pred_lag21,
+    extreme_heat,
+    21,
+    "Extreme heat"
+  ) %>%
+    mutate(model = "Lag 21 E3_L3"),
+
+  summarise_lag_windows(
+    pred_lag21,
+    cold_value,
+    21,
+    "Cold"
+  ) %>%
+    mutate(model = "Lag 21 E3_L3")
+
+)
+
+flextable(lag_window_results) %>%
+  colformat_num(
+    j = "cumulative_RR",
+    digits = 3
+  ) %>%
+  autofit()
+
+write_csv(
+  lag_window_results,
+  "Results/LagComparison/Table_Lag_Window_Effects.csv"
+)
+
+```
+
+37. Specifically evaluate the additional Lag 15–21 contribution
+
+This is important for deciding whether Lag 21 is adding meaningful delayed information or mainly extending the model into a harvesting period.
+
+
+```{r}
+lag15_21_summary <- function(pred) {
+
+  if (max(pred$lag) < 21) {
+    return(NULL)
+  }
+
+  idx_15_21 <-
+    16:22
+
+  tibble(
+
+    exposure =
+      pred$predvar,
+
+    incremental_RR_15_21 =
+      exp(
+        rowSums(
+          log(
+            pred$matRRfit[
+              ,
+              idx_15_21
+            ]
+          ),
+          na.rm = TRUE
+        )
+      )
+
+  )
+}
+
+incremental_15_21 <- lag15_21_summary(
+  pred_lag21
+)
+
+p_incremental_15_21 <- ggplot(
+  incremental_15_21,
+  aes(
+    x = exposure,
+    y = incremental_RR_15_21
+  )
+) +
+
+  geom_hline(
+    yintercept = 1,
+    linewidth = 0.4
+  ) +
+
+  geom_line(
+    linewidth = 0.8
+  ) +
+
+  labs(
+    title =
+      "Incremental RR contributed by Lag 15–21",
+
+    subtitle =
+      "Lag 21 E3_L3",
+
+    x =
+      "Mean UTCI (°C)",
+
+    y =
+      "RR from additional lags 15–21"
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  )
+
+p_incremental_15_21
+
+ggsave(
+  "Results/LagComparison/Figure_Lag15_21_Incremental_RR.png",
+  p_incremental_15_21,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+write_csv(
+  incremental_15_21,
+  "Results/LagComparison/Table_Lag15_21_Incremental_RR.csv"
+)
+
+```
+
+38. Pre-lock lag comparison table
+
+```{r}
+get_mmt <- function(pred) {
+
+  idx <-
+    which.min(
+      pred$allRRfit
+    )
+
+  pred$predvar[idx]
+}
+
+lag_decision_table <- tibble(
+
+  Candidate =
+    c(
+      "Lag7_E3_L3",
+      "Lag14_E3_L3",
+      "Lag21_E3_L3"
+    ),
+
+  Maximum_lag_days =
+    c(7, 14, 21),
+
+  Exposure_df =
+    c(3, 3, 3),
+
+  Lag_df =
+    c(3, 3, 3),
+
+  MMT =
+    c(
+      get_mmt(pred_lag7),
+      get_mmt(pred_lag14),
+      get_mmt(pred_lag21)
+    ),
+
+  Maximum_cumulative_RR =
+    c(
+      max(
+        pred_lag7$cumRRfit,
+        na.rm = TRUE
+      ),
+
+      max(
+        pred_lag14$cumRRfit,
+        na.rm = TRUE
+      ),
+
+      max(
+        pred_lag21$cumRRfit,
+        na.rm = TRUE
+      )
+    ),
+
+  Minimum_cumulative_RR =
+    c(
+      min(
+        pred_lag7$cumRRfit,
+        na.rm = TRUE
+      ),
+
+      min(
+        pred_lag14$cumRRfit,
+        na.rm = TRUE
+      ),
+
+      min(
+        pred_lag21$cumRRfit,
+        na.rm = TRUE
+      )
+    ),
+
+  QAIC =
+    c(
+      qaic_deviance(
+        fit_lag7_e3_l3$fit
+      ),
+
+      qaic_deviance(
+        fit_lag14_e3_l3$fit
+      ),
+
+      qaic_deviance(
+        fit_lag21_e3_l3$fit
+      )
+    ),
+
+  Dispersion =
+    c(
+      fit_lag7_e3_l3$dispersion,
+      fit_lag14_e3_l3$dispersion,
+      fit_lag21_e3_l3$dispersion
+    ),
+
+  Kappa =
+    c(
+      fit_lag7_e3_l3$kappa,
+      fit_lag14_e3_l3$kappa,
+      fit_lag21_e3_l3$kappa
+    )
+
+)
+
+flextable(lag_decision_table) %>%
+  colformat_num(
+    digits = 3
+  ) %>%
+  autofit()
+
+write_csv(
+  lag_decision_table,
+  "Results/LagComparison/Table_Lag_Decision_Pre_Lock.csv"
+)
+
+```
+
+39. Manual primary-lag decision gate
+
+Do not automatically choose the lag.
+
+This is deliberately left to the investigator after inspecting the empirical outputs.
+
+
+```{r}
+PRIMARY_LAG <- params$primary_lag
+
+if (!is.null(PRIMARY_LAG)) {
+
+  if (!PRIMARY_LAG %in% c(7, 14, 21)) {
+
+    stop(
+      "PRIMARY_LAG must be 7, 14 or 21."
+    )
+
+  }
+
+  message(
+    "PRIMARY_LAG manually locked to: ",
+    PRIMARY_LAG
+  )
+
+} else {
+
+  message(
+    "\n====================================================\n",
+    "PRIMARY LAG IS NOT YET LOCKED\n",
+    "====================================================\n",
+    "Review:\n",
+    "1. Cumulative RR comparison\n",
+    "2. Lag-response curves\n",
+    "3. Lag 7 3D surface\n",
+    "4. Lag 14 3D surface\n",
+    "5. Lag 21 3D surface\n",
+    "6. Lag 15–21 incremental RR\n",
+    "7. Diagnostic table\n\n",
+    "Then set exactly ONE:\n",
+    "PRIMARY_LAG <- 7\n",
+    "PRIMARY_LAG <- 14\n",
+    "PRIMARY_LAG <- 21\n",
+    "===================================================="
+  )
+
+}
+
+```
+
+40. Manual primary-lag selection block
+
+When you are ready, change only this section:
+
+```{r}
+
+# ============================================================
+# MANUAL PRIMARY LAG SELECTION
+# ============================================================
+
+# PRIMARY_LAG <- 7
+
+# PRIMARY_LAG <- 14
+
+# PRIMARY_LAG <- 21
+```
+
+
+
+The recommendation is not to choose based on the smallest QAIC alone.
+
+The decision should consider:
+
+biological plausibility;
+stability of the exposure-response curve;
+stability of the lag-response structure;
+cumulative RR;
+whether additional lags contribute meaningfully;
+whether Lag 15–21 appears to represent delayed effect or harvesting;
+model diagnostics;
+interpretability;
+consistency with the prespecified epidemiological objective.
+41. Select the manually locked model
+
+```{r}
+if (is.null(PRIMARY_LAG)) {
+
+  message(
+    "Primary model remains unlocked. ",
+    "Candidate lag comparison has been completed."
+  )
+
+  primary_fit <- NULL
+  primary_pred <- NULL
+
+} else {
+
+  primary_fit <- switch(
+
+    as.character(PRIMARY_LAG),
+
+    "7" = fit_lag7_e3_l3,
+
+    "14" = fit_lag14_e3_l3,
+
+    "21" = fit_lag21_e3_l3
+
+  )
+
+  primary_pred <- switch(
+
+    as.character(PRIMARY_LAG),
+
+    "7" = pred_lag7,
+
+    "14" = pred_lag14,
+
+    "21" = pred_lag21
+
+  )
+
+}
+
+```
+
+42. Primary model diagnostic check
+
+```{r}
+if (!is.null(primary_fit)) {
+
+  primary_diagnostic <-
+    diagnose_dlnm_fit(
+      primary_fit$cb,
+      primary_fit$fit,
+      paste0(
+        "Lag",
+        PRIMARY_LAG,
+        "_E3_L3"
+      )
+    )
+
+  print(
+    primary_diagnostic
+  )
+
+}
+
+```
+
+43. Primary exposure-response curve
+
+```{r}
+if (!is.null(primary_pred)) {
+
+  p_primary <- ggplot(
+
+    tibble(
+
+      exposure =
+        primary_pred$predvar,
+
+      RR =
+        primary_pred$allRRfit,
+
+      low =
+        primary_pred$allRRlow,
+
+      high =
+        primary_pred$allRRhigh
+
+    ),
+
+    aes(
+      x = exposure,
+      y = RR
+    )
+
+  ) +
+
+    geom_hline(
+      yintercept = 1,
+      linewidth = 0.4
+    ) +
+
+    geom_ribbon(
+      aes(
+        ymin = low,
+        ymax = high
+      ),
+      alpha = 0.15
+    ) +
+
+    geom_line(
+      linewidth = 0.9
+    ) +
+
+    geom_vline(
+      xintercept = COMMON_CEN,
+      linetype = 2
+    ) +
+
+    labs(
+      title =
+        paste0(
+          "Primary UTCI–mortality exposure-response curve: Lag ",
+          PRIMARY_LAG,
+          " E3_L3"
+        ),
+
+      x =
+        "Mean UTCI (°C)",
+
+      y =
+        "Relative risk"
+    ) +
+
+    theme_minimal(
+      base_size = 12
+    )
+
+  p_primary
+
+  ggsave(
+    paste0(
+      "Results/PrimaryModel/Figure_Primary_Exposure_Response_Lag",
+      PRIMARY_LAG,
+      "_E3_L3.png"
+    ),
+    p_primary,
+    width = 9,
+    height = 6,
+    dpi = 300
+  )
+
+}
+
+```
+
+44. Primary model MMT
+
+For the final model, identify the minimum of the overall exposure-response curve on the prediction grid.
+```{r}
+
+
+if (!is.null(primary_pred)) {
+
+  mmt_index <-
+    which.min(
+      primary_pred$allRRfit
+    )
+
+  PRIMARY_MMT <-
+    primary_pred$predvar[
+      mmt_index
+    ]
+
+  PRIMARY_MMT
+
+}
+
+```
+
+45. Memory-safe uncertainty for MMT and nonlinear derived quantities
+Important methodological update
+
+Do not run:
+
+for (b in 1:1000) {
+    resample_data()
+    refit_gnm()
+}
+
+on this 186,628-row case-crossover dataset.
+
+That approach repeatedly constructs large model matrices and repeatedly fits conditional quasi-Poisson models. It is unnecessarily expensive and can cause memory exhaustion.
+
+Instead, the preferred calculation here is parametric Monte Carlo simulation from the fitted coefficient vector and its variance-covariance matrix.
+
+The original analysis framework already adopted this approach specifically to avoid repeated model refitting.
+
+The implementation below is additionally memory-conscious:
+
+simulations are processed in chunks;
+the complete nsim × prediction-grid matrix is never required;
+only the quantities needed for the MMT distribution are retained;
+Cholesky decomposition is calculated once;
+the random coefficient draws are generated in manageable batches.
+
+```{r}
+mmt_mc_uncertainty <- function(
+
+    cb,
+
+    fit,
+
+    exposure_data,
+
+    lower_quantile = 0.05,
+
+    upper_quantile = 0.95,
+
+    by = 0.1,
+
+    nsim = 10000,
+
+    chunk_size = 250,
+
+    seed = 1
+
+) {
+
+  set.seed(seed)
+
+  pars <-
+    extract_crossbasis_parameters(
+      cb,
+      fit
+    )
+
+  beta <-
+    as.numeric(
+      pars$coef
+    )
+
+  V <-
+    as.matrix(
+      pars$vcov
+    )
+
+  p <-
+    length(beta)
+
+  exposure_limits <-
+    quantile(
+      exposure_data,
+      c(
+        lower_quantile,
+        upper_quantile
+      ),
+      na.rm = TRUE
+    )
+
+  base_pred <-
+    dlnm::crosspred(
+      cb,
+      coef = pars$coef,
+      vcov = pars$vcov,
+      model.link = "log",
+      by = by,
+      cumul = TRUE
+    )
+
+  grid <-
+    as.numeric(
+      base_pred$predvar
+    )
+
+  keep <-
+    grid >= exposure_limits[1] &
+    grid <= exposure_limits[2]
+
+  grid_use <-
+    grid[keep]
+
+  # ------------------------------------------
+  # Stable Cholesky decomposition
+  # ------------------------------------------
+
+  eig <-
+    eigen(
+      V,
+      symmetric = TRUE
+    )
+
+  eig$values[
+    eig$values < 0
+  ] <- 0
+
+  root_V <-
+    eig$vectors %*%
+    diag(
+      sqrt(
+        eig$values
+      ),
+      nrow = p
+    )
+
+  # ------------------------------------------
+  # Storage only for MMT
+  # ------------------------------------------
+
+  mmt_values <-
+    rep(
+      NA_real_,
+      nsim
+    )
+
+  # Optional storage of selected tail predictions
+  # only, rather than the complete prediction matrix.
+
+  target_exposures <-
+    c(
+      quantile(
+        exposure_data,
+        c(
+          .01,
+          .05,
+          .95,
+          .99
+        ),
+        na.rm = TRUE
+      )
+    )
+
+  target_indices <-
+    vapply(
+
+      target_exposures,
+
+      function(x)
+        which.min(
+          abs(
+            grid -
+              x
+          )
+        ),
+
+      integer(1)
+
+    )
+
+  target_draws <-
+    matrix(
+      NA_real_,
+      nrow = nsim,
+      ncol = length(
+        target_indices
+      )
+    )
+
+  # ------------------------------------------
+  # Prediction matrix for exposure-response
+  # ------------------------------------------
+
+  full_base <-
+    dlnm::crosspred(
+      cb,
+      coef = pars$coef,
+      vcov = pars$vcov,
+      model.link = "log",
+      by = by,
+      cumul = TRUE
+    )
+
+  # matfit is the linear predictor contribution
+  # for each exposure and lag combination.
+  #
+  # For MMT we require the overall cumulative
+  # exposure-response coefficient vector.
+
+  overall_basis <-
+    full_base$matfit
+
+  # ------------------------------------------
+  # Simulation in chunks
+  # ------------------------------------------
+
+  starts <-
+    seq(
+      1,
+      nsim,
+      by = chunk_size
+    )
+
+  for (start_i in starts) {
+
+    end_i <-
+      min(
+        start_i +
+          chunk_size -
+          1,
+        nsim
+      )
+
+    n_chunk <-
+      end_i -
+      start_i +
+      1
+
+    Z <-
+      matrix(
+        rnorm(
+          n_chunk *
+            p
+        ),
+        nrow = n_chunk,
+        ncol = p
+      )
+
+    beta_sim <-
+      sweep(
+        Z %*% t(root_V),
+        2,
+        beta,
+        "+"
+      )
+
+    # ----------------------------------------
+    # Reconstruct cumulative exposure-response
+    # ----------------------------------------
+
+    # The crosspred object stores the prediction
+    # basis through its coefficient-space representation.
+    #
+    # Reconstruct using the crossbasis prediction
+    # matrices generated by crosspred.
+
+    chunk_rr <-
+      matrix(
+        NA_real_,
+        nrow = n_chunk,
+        ncol = length(
+          grid
+        )
+      )
+
+    for (j in seq_along(grid)) {
+
+      # Overall cumulative coefficient vector
+      # represented by the corresponding row
+      # of the prediction matrix.
+
+      basis_row <-
+        full_base$matfit[j, ]
+
+      chunk_rr[, j] <-
+        exp(
+          beta_sim %*%
+            basis_row
+        )
+
+    }
+
+    # ----------------------------------------
+    # MMT from grid
+    # ----------------------------------------
+
+    selected_rr <-
+      chunk_rr[, keep, drop = FALSE]
+
+    local_mmt <-
+      apply(
+        selected_rr,
+        1,
+        function(x)
+          grid_use[
+            which.min(x)
+          ]
+      )
+
+    mmt_values[
+      start_i:end_i
+    ] <-
+      local_mmt
+
+    target_draws[
+      start_i:end_i,
+      ] <-
+      chunk_rr[
+        ,
+        target_indices,
+        drop = FALSE
+      ]
+
+    rm(
+      Z,
+      beta_sim,
+      chunk_rr,
+      selected_rr,
+      local_mmt
+    )
+
+    gc(
+      verbose = FALSE
+    )
+  }
+
+  list(
+
+    mmt =
+      mmt_values,
+
+    mmt_ci =
+      quantile(
+        mmt_values,
+        c(
+          0.025,
+          0.975
+        ),
+        na.rm = TRUE
+      ),
+
+    target_exposures =
+      target_exposures,
+
+    target_rr =
+      target_draws,
+
+    grid =
+      grid,
+
+    seed =
+      seed,
+
+    nsim =
+      nsim
+
+  )
+}
+
+```
+
+46. Run Monte Carlo uncertainty only after primary lag is locked
+
+```{r}
+if (!is.null(primary_fit)) {
+
+  mmt_mc <-
+    mmt_mc_uncertainty(
+
+      cb =
+        primary_fit$cb,
+
+      fit =
+        primary_fit$fit,
+
+      exposure_data =
+        primary_fit$data$utci_lag0,
+
+      lower_quantile =
+        params$mmt_lower_quantile,
+
+      upper_quantile =
+        params$mmt_upper_quantile,
+
+      by =
+        0.1,
+
+      nsim =
+        params$mc_draws,
+
+      chunk_size =
+        250,
+
+      seed =
+        params$seed
+
+    )
+
+  mmt_summary <- tibble(
+
+    Primary_lag =
+      PRIMARY_LAG,
+
+    MMT_point_estimate =
+      median(
+        mmt_mc$mmt,
+        na.rm = TRUE
+      ),
+
+    MMT_lower_95 =
+      mmt_mc$mmt_ci[1],
+
+    MMT_upper_95 =
+      mmt_mc$mmt_ci[2],
+
+    Monte_Carlo_draws =
+      params$mc_draws
+
+  )
+
+  flextable(mmt_summary) %>%
+    colformat_num(
+      digits = 2
+    ) %>%
+    autofit()
+
+  write_csv(
+    mmt_summary,
+    "Results/Uncertainty/Table_MMT_Monte_Carlo.csv"
+  )
+
+  saveRDS(
+    mmt_mc,
+    "Results/Uncertainty/MMT_Monte_Carlo.rds"
+  )
+
+}
+
+
+
+```
+
+
+
+
+47. MMT uncertainty distribution
+
+```{r}
+if (!is.null(primary_fit)) {
+
+  mmt_df <- tibble(
+    MMT =
+      mmt_mc$mmt
+  )
+
+  p_mmt <- ggplot(
+    mmt_df,
+    aes(
+      x = MMT
+    )
+  ) +
+
+    geom_histogram(
+      bins = 50
+    ) +
+
+    geom_vline(
+      xintercept =
+        PRIMARY_MMT,
+      linetype = 2
+    ) +
+
+    labs(
+      title =
+        paste0(
+          "Monte Carlo distribution of MMT: Lag ",
+          PRIMARY_LAG,
+          " E3_L3"
+        ),
+
+      x =
+        "Minimum-mortality temperature (°C)",
+
+      y =
+        "Monte Carlo draws"
+    ) +
+
+    theme_minimal(
+      base_size = 12
+    )
+
+  p_mmt
+
+  ggsave(
+    paste0(
+      "Results/Uncertainty/Figure_MMT_Distribution_Lag",
+      PRIMARY_LAG,
+      ".png"
+    ),
+    p_mmt,
+    width = 9,
+    height = 6,
+    dpi = 300
+  )
+
+}
+```
+
+48. Primary lag-specific response
+
+```{r}
+if (!is.null(primary_pred)) {
+
+  primary_lag_response <- as.data.frame(
+    primary_pred$matRRfit
+  )
+
+  colnames(
+    primary_lag_response
+  ) <-
+    paste0(
+      "lag",
+      0:PRIMARY_LAG
+    )
+
+  primary_lag_response <-
+    primary_lag_response %>%
+    mutate(
+      exposure =
+        primary_pred$predvar
+    ) %>%
+    relocate(
+      exposure
+    )
+
+  write_csv(
+    primary_lag_response,
+    paste0(
+      "Results/PrimaryModel/Table_Primary_Lag_Specific_RR_Lag",
+      PRIMARY_LAG,
+      ".csv"
+    )
+  )
+
+}
+
+```
+
+49. Primary model cumulative RR at clinically meaningful contrasts
+
+Do not assume arbitrary clinical cut-offs. Use empirical percentile contrasts around the MMT unless the protocol separately specifies clinically meaningful thresholds.
+
+
+```{r}
+if (!is.null(primary_pred)) {
+
+  exposure_quantiles <-
+    quantile(
+      primary_fit$data$utci_lag0,
+      c(
+        .01,
+        .05,
+        .50,
+        .95,
+        .99
+      ),
+      na.rm = TRUE
+    )
+
+  primary_contrast_table <-
+    tibble(
+
+      Exposure_label =
+        c(
+          "P01",
+          "P05",
+          "Median",
+          "P95",
+          "P99"
+        ),
+
+      UTCI =
+        as.numeric(
+          exposure_quantiles
+        )
+
+    ) %>%
+
+    mutate(
+
+      grid_value =
+        map_dbl(
+          UTCI,
+          ~ nearest_prediction_value(
+            primary_pred,
+            .x
+          )
+        )
+
+    ) %>%
+
+    mutate(
+
+      Cumulative_RR =
+        map_dbl(
+          grid_value,
+          ~ primary_pred$cumRRfit[
+            which(
+              primary_pred$predvar ==
+                .x
+            )
+          ]
+        ),
+
+      Lower_95 =
+        map_dbl(
+          grid_value,
+          ~ primary_pred$cumRRlow[
+            which(
+              primary_pred$predvar ==
+                .x
+            )
+          ]
+        ),
+
+      Upper_95 =
+        map_dbl(
+          grid_value,
+          ~ primary_pred$cumRRhigh[
+            which(
+              primary_pred$predvar ==
+                .x
+            )
+          ]
+        )
+
+    )
+
+  flextable(
+    primary_contrast_table
+  ) %>%
+    colformat_num(
+      digits = 3
+    ) %>%
+    autofit()
+
+  write_csv(
+    primary_contrast_table,
+    paste0(
+      "Results/PrimaryModel/Table_Primary_Cumulative_RR_Lag",
+      PRIMARY_LAG,
+      ".csv"
+    )
+  )
+
+}
+
+```
+
+50. Objective 2: lag-response / mortality displacement assessment
+
+```{r}
+if (!is.null(primary_pred)) {
+
+  objective2_lag_windows <-
+    summarise_lag_windows(
+
+      primary_pred,
+
+      moderate_heat,
+
+      PRIMARY_LAG,
+
+      "Moderate heat"
+
+    )
+
+  objective2_lag_windows <-
+    bind_rows(
+
+      objective2_lag_windows,
+
+      summarise_lag_windows(
+        primary_pred,
+        extreme_heat,
+        PRIMARY_LAG,
+        "Extreme heat"
+      ),
+
+      summarise_lag_windows(
+        primary_pred,
+        cold_value,
+        PRIMARY_LAG,
+        "Cold"
+      )
+
+    )
+
+  flextable(
+    objective2_lag_windows
+  ) %>%
+    colformat_num(
+      j = "cumulative_RR",
+      digits = 3
+    ) %>%
+    autofit()
+
+  write_csv(
+    objective2_lag_windows,
+    paste0(
+      "Results/Tables/Objective2_Lag_Window_Characterisation_Lag",
+      PRIMARY_LAG,
+      ".csv"
+    )
+  )
+
+}
+
+```
+
+51. Objective 3: temporal-period analysis
+
+The actual observed years in the processed data must be used. Do not silently impose a period that is absent from the dataset.
+```{r}
+
+
+observed_years <- sort(
+  unique(
+    model_data$year
+  )
+)
+
+observed_year_range <- range(
+  observed_years,
+  na.rm = TRUE
+)
+
+tibble(
+  First_year = observed_year_range[1],
+  Last_year = observed_year_range[2],
+  Number_of_years = length(observed_years)
+) %>%
+  flextable() %>%
+  autofit()
+
+
+The following creates data-driven early/late periods only if there are sufficient years to support them.
+
+
+if (
+  length(observed_years) >= 4
+) {
+
+  midpoint_year <-
+    floor(
+      mean(
+        observed_year_range
+      )
+    )
+
+  periods <- list(
+
+    Early =
+      c(
+        observed_year_range[1],
+        midpoint_year
+      ),
+
+    Late =
+      c(
+        midpoint_year + 1,
+        observed_year_range[2]
+      )
+
+  )
+
+} else {
+
+  periods <- NULL
+
+}
+```
+
+
+52. Temporal model fitting
+```{r}
+
+temporal_results <- NULL
+
+if (!is.null(periods) &&
+    !is.null(primary_fit)) {
+
+  temporal_results <-
+    purrr::imap(
+
+      periods,
+
+      function(period_range, period_name) {
+
+        period_data <-
+          model_data %>%
+          filter(
+            year >= period_range[1],
+            year <= period_range[2]
+          )
+
+        if (
+          n_distinct(
+            period_data$stratum_id
+          ) < 20
+        ) {
+          return(NULL)
+        }
+
+        run_dlnm_spec(
+          period_data,
+          max_lag =
+            PRIMARY_LAG,
+          exposure_df = 3,
+          lag_df = 3
+        )
+
+      }
+
+    )
+
+  names(
+    temporal_results
+  ) <-
+    names(periods)
+
+}
+
+```
+
+53. Temporal exposure-response curves
+
+```{r}
+if (
+  !is.null(temporal_results) &&
+  all(
+    !vapply(
+      temporal_results,
+      is.null,
+      logical(1)
+    )
+  )
+) {
+
+  temporal_predictions <-
+    purrr::imap(
+
+      temporal_results,
+
+      function(obj, period_name) {
+
+        safe_crosspred(
+          obj$cb,
+          obj$fit,
+          cen = COMMON_CEN,
+          by = 0.1,
+          cumul = TRUE
+        )
+
+      }
+
+    )
+
+  temporal_curve_data <-
+    purrr::imap_dfr(
+
+      temporal_predictions,
+
+      function(pred, period_name) {
+
+        tibble(
+
+          exposure =
+            pred$predvar,
+
+          RR =
+            pred$allRRfit,
+
+          low =
+            pred$allRRlow,
+
+          high =
+            pred$allRRhigh,
+
+          period =
+            period_name
+
+        )
+
+      }
+
+    )
+
+  p_temporal <-
+    ggplot(
+      temporal_curve_data,
+      aes(
+        x = exposure,
+        y = RR,
+        linetype = period
+      )
+    ) +
+
+    geom_hline(
+      yintercept = 1,
+      linewidth = .4
+    ) +
+
+    geom_line(
+      linewidth = .9
+    ) +
+
+    labs(
+      title =
+        "Temporal comparison of UTCI–mortality exposure-response",
+      x =
+        "Mean UTCI (°C)",
+      y =
+        "Cumulative relative risk",
+      linetype =
+        "Period"
+    ) +
+
+    theme_minimal(
+      base_size = 12
+    )
+
+  p_temporal
+
+  ggsave(
+    "Results/Figures/Figure_Temporal_Exposure_Response.png",
+    p_temporal,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+
+}
+
+```
+
+54. Objective 4: sex-specific analyses
+
+```{r}
+if (!is.null(primary_fit)) {
+
+  sex_values <-
+    sort(
+      unique(
+        model_data$sex[
+          !is.na(
+            model_data$sex
+          )
+        ]
+      )
+    )
+
+  sex_results <-
+    purrr::map(
+
+      sex_values,
+
+      function(s) {
+
+        subgroup_data <-
+          model_data %>%
+          filter(
+            sex == s
+          )
+
+        if (
+          n_distinct(
+            subgroup_data$stratum_id
+          ) < 20
+        ) {
+          return(NULL)
+        }
+
+        run_dlnm_spec(
+          subgroup_data,
+          max_lag =
+            PRIMARY_LAG,
+          exposure_df = 3,
+          lag_df = 3
+        )
+
+      }
+
+    )
+
+  names(
+    sex_results
+  ) <-
+    paste0(
+      "Sex_",
+      sex_values
+    )
+
+}
+
+55. Age-specific analyses
+
+Use the age groups already present in the processed analytical matrix rather than inventing new clinical categories.
+
+
+if (!is.null(primary_fit)) {
+
+  age_groups_present <-
+    unique(
+      model_data$age_group
+    )
+
+  age_groups_present <-
+    age_groups_present[
+      !is.na(
+        age_groups_present
+      )
+    ]
+
+  age_results <-
+    purrr::map(
+
+      age_groups_present,
+
+      function(age_category) {
+
+        subgroup_data <-
+          model_data %>%
+          filter(
+            age_group ==
+              age_category
+          )
+
+        if (
+          n_distinct(
+            subgroup_data$stratum_id
+          ) < 20
+        ) {
+          return(NULL)
+        }
+
+        run_dlnm_spec(
+          subgroup_data,
+          max_lag =
+            PRIMARY_LAG,
+          exposure_df = 3,
+          lag_df = 3
+        )
+
+      }
+
+    )
+
+  names(
+    age_results
+  ) <-
+    as.character(
+      age_groups_present
+    )
+
+}
+
+```
+
+56. Subgroup prediction curves
+
+```{r}
+plot_subgroup_predictions <- function(
+    results_list,
+    filename,
+    title
+) {
+
+  valid_results <-
+    results_list[
+      !vapply(
+        results_list,
+        is.null,
+        logical(1)
+      )
+    ]
+
+  if (
+    length(valid_results) == 0
+  ) {
+    return(NULL)
+  }
+
+  curves <-
+    purrr::imap_dfr(
+
+      valid_results,
+
+      function(obj, label) {
+
+        pred <-
+          safe_crosspred(
+            obj$cb,
+            obj$fit,
+            cen = COMMON_CEN,
+            by = .1,
+            cumul = TRUE
+          )
+
+        tibble(
+
+          exposure =
+            pred$predvar,
+
+          RR =
+            pred$allRRfit,
+
+          low =
+            pred$allRRlow,
+
+          high =
+            pred$allRRhigh,
+
+          subgroup =
+            label
+
+        )
+
+      }
+
+    )
+
+  p <-
+    ggplot(
+      curves,
+      aes(
+        exposure,
+        RR,
+        linetype = subgroup
+      )
+    ) +
+
+    geom_hline(
+      yintercept = 1,
+      linewidth = .4
+    ) +
+
+    geom_line(
+      linewidth = .8
+    ) +
+
+    labs(
+      title = title,
+      x = "Mean UTCI (°C)",
+      y = "Cumulative relative risk",
+      linetype = "Subgroup"
+    ) +
+
+    theme_minimal(
+      base_size = 12
+    )
+
+  p
+
+  ggsave(
+    filename,
+    p,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+
+  invisible(
+    p
+  )
+}
+
+```
+
+57. Sex-specific figure
+
+```{r}
+if (
+  exists("sex_results") &&
+  !is.null(primary_fit)
+) {
+
+  plot_subgroup_predictions(
+
+    sex_results,
+
+    "Results/Subgroups/Figure_Sex_Specific_Cumulative_RR.png",
+
+    paste0(
+      "Sex-specific UTCI–mortality curves: Lag ",
+      PRIMARY_LAG,
+      " E3_L3"
+    )
+
+  )
+
+}
+```
+
+
+58. Age-specific figure
+
+```{r}
+if (
+  exists("age_results") &&
+  !is.null(primary_fit)
+) {
+
+  plot_subgroup_predictions(
+
+    age_results,
+
+    "Results/Subgroups/Figure_Age_Specific_Cumulative_RR.png",
+
+    paste0(
+      "Age-specific UTCI–mortality curves: Lag ",
+      PRIMARY_LAG,
+      " E3_L3"
+    )
+
+  )
+
+}
+```
+
+
+59. Centre-level mortality counts
+
+```{r}
+centre_qc <- death_cases %>%
+  count(
+    centreid,
+    centre_name,
+    country,
+    name = "deaths"
+  ) %>%
+  mutate(
+    sufficient_deaths =
+      deaths >=
+      params$min_centre_deaths
+  ) %>%
+  arrange(
+    deaths
+  )
+
+flextable(
+  centre_qc
+) %>%
+  autofit()
+
+write_csv(
+  centre_qc,
+  "Results/Diagnostics/Centre_Death_Count_QC.csv"
+)
+```
+
+
+60. Case-crossover stratum QC
+```{r}
+
+stratum_qc_summary <- tibble(
+
+  Total_strata =
+    nrow(stratum_qc),
+
+  Strata_with_one_case =
+    sum(
+      stratum_qc$n_cases == 1
+    ),
+
+  Strata_with_no_case =
+    sum(
+      stratum_qc$n_cases == 0
+    ),
+
+  Strata_with_multiple_cases =
+    sum(
+      stratum_qc$n_cases > 1
+    ),
+
+  Mean_referents =
+    mean(
+      stratum_qc$n_referents
+    ),
+
+  Median_referents =
+    median(
+      stratum_qc$n_referents
+    ),
+
+  Minimum_referents =
+    min(
+      stratum_qc$n_referents
+    ),
+
+  Maximum_referents =
+    max(
+      stratum_qc$n_referents
+    )
+
+)
+
+flextable(
+  stratum_qc_summary
+) %>%
+  colformat_num(
+    digits = 2
+  ) %>%
+  autofit()
+
+write_csv(
+  stratum_qc_summary,
+  "Results/Diagnostics/Case_Crossover_Structure_QC.csv"
+)
+
+write_csv(
+  stratum_qc,
+  "Results/Diagnostics/Case_Crossover_Stratum_QC.csv"
+)
+
+```
+
+61. Exposure missingness
+
+```{r}
+exposure_missingness <- tibble(
+
+  Variable =
+    c(
+      "utci_lag0",
+      "utci_lag7",
+      "utci_lag14",
+      "utci_lag21"
+    ),
+
+  Missing =
+    c(
+      sum(
+        is.na(
+          dat$utci_lag0
+        )
+      ),
+
+      sum(
+        is.na(
+          dat$utci_lag7
+        )
+      ),
+
+      sum(
+        is.na(
+          dat$utci_lag14
+        )
+      ),
+
+      sum(
+        is.na(
+          dat$utci_lag21
+        )
+      )
+    )
+
+) %>%
+  mutate(
+    Percent_missing =
+      100 *
+      Missing /
+      nrow(dat)
+  )
+
+flextable(
+  exposure_missingness
+) %>%
+  colformat_num(
+    j = "Percent_missing",
+    digits = 2
+  ) %>%
+  autofit()
+
+write_csv(
+  exposure_missingness,
+  "Results/Diagnostics/Exposure_Missingness.csv"
+)
+
+```
+
+62. Final primary model object
+
+This section only executes if the primary lag has actually been locked.
+
+```{r}
+
+if (!is.null(primary_fit)) {
+
+  best_spec <- list(
+
+    model_id =
+      paste0(
+        "Lag",
+        PRIMARY_LAG,
+        "_E3_L3"
+      ),
+
+    max_lag =
+      PRIMARY_LAG,
+
+    exposure_df =
+      3,
+
+    lag_df =
+      3,
+
+    centering =
+      COMMON_CEN,
+
+    MMT =
+      PRIMARY_MMT
+
+  )
+
+  saveRDS(
+    best_spec,
+    "Results/Objects/best_specification.rds"
+  )
+
+  saveRDS(
+    primary_fit,
+    "Results/Objects/best_model.rds"
+  )
+
+  write_csv(
+    tibble(
+
+      Model =
+        best_spec$model_id,
+
+      Maximum_lag =
+        best_spec$max_lag,
+
+      Exposure_df =
+        best_spec$exposure_df,
+
+      Lag_df =
+        best_spec$lag_df,
+
+      Centering =
+        best_spec$centering,
+
+      MMT =
+        best_spec$MMT,
+
+      Dispersion =
+        primary_fit$dispersion,
+
+      Kappa =
+        primary_fit$kappa,
+
+      QAIC =
+        qaic_deviance(
+          primary_fit$fit
+        )
+
+    ),
+
+    "Results/PrimaryModel/Locked_Primary_Model_Diagnostics.csv"
+
+  )
+
+}
+
+```
+
+63. Final publication-ready primary table
+
+```{r}
+if (!is.null(primary_fit)) {
+
+  final_primary_table <- tibble(
+
+    Parameter =
+      c(
+        "Primary model",
+        "Maximum lag",
+        "Exposure spline df",
+        "Lag spline df",
+        "Centering UTCI",
+        "MMT",
+        "Dispersion",
+        "Condition number",
+        "QAIC"
+      ),
+
+    Estimate =
+      c(
+        paste0(
+          "Lag",
+          PRIMARY_LAG,
+          "_E3_L3"
+        ),
+
+        PRIMARY_LAG,
+
+        3,
+
+        3,
+
+        round(
+          COMMON_CEN,
+          2
+        ),
+
+        round(
+          PRIMARY_MMT,
+          2
+        ),
+
+        round(
+          primary_fit$dispersion,
+          4
+        ),
+
+        round(
+          primary_fit$kappa,
+          2
+        ),
+
+        round(
+          qaic_deviance(
+            primary_fit$fit
+          ),
+          2
+        )
+      )
+
+  )
+
+  flextable(
+    final_primary_table
+  ) %>%
+    autofit()
+
+  write_csv(
+    final_primary_table,
+    "Results/Tables/Table_Final_Primary_Model.csv"
+  )
+
+}
+
+```
+
+64. Reproducibility and analysis decision log
+```{r}
+
+decision_log <- tibble(
+
+  Decision =
+    c(
+      "Analytical dataset",
+      "Study design",
+      "Outcome",
+      "Exposure",
+      "Candidate models",
+      "Primary lag",
+      "Exposure spline",
+      "Lag spline",
+      "Case-crossover conditioning",
+      "Prediction centering",
+      "MMT uncertainty",
+      "Random seed",
+      "Monte Carlo draws"
+    ),
+
+  Specification =
+    c(
+
+      analysis_file,
+
+      "Time-stratified case-crossover",
+
+      "All-cause mortality",
+
+      "Daily mean UTCI",
+
+      "Lag 7 / Lag 14 / Lag 21; E3_L3",
+
+      ifelse(
+        is.null(PRIMARY_LAG),
+        "NOT YET LOCKED",
+        paste0(
+          "Lag ",
+          PRIMARY_LAG
+        )
+      ),
+
+      "Natural spline, df=3",
+
+      "Natural spline, df=3",
+
+      "factor(stratum_id) eliminated in gnm",
+
+      paste0(
+        "Median UTCI = ",
+        round(
+          COMMON_CEN,
+          2
+        ),
+        " °C"
+      ),
+
+      "Parametric coefficient Monte Carlo; chunked",
+
+      as.character(
+        params$seed
+      ),
+
+      as.character(
+        params$mc_draws
+      )
+
+    )
+
+)
+
+flextable(
+  decision_log
+) %>%
+  autofit()
+
+write_csv(
+  decision_log,
+  "Results/Diagnostics/Analysis_Decision_Log.csv"
+)
+
+```
+
+65. Final validation checklist
+
+```{r}
+validation <- tibble(
+
+  Check =
+    c(
+
+      "Analytical dataset imported",
+
+      "Required variables present",
+
+      "Outcome is binary",
+
+      "One case per stratum",
+
+      "At least one referent per stratum",
+
+      "UTCI lag 0 available",
+
+      "UTCI lag 7 available",
+
+      "UTCI lag 14 available",
+
+      "UTCI lag 21 available",
+
+      "Lag 7 model fitted",
+
+      "Lag 14 model fitted",
+
+      "Lag 21 model fitted",
+
+      "Crossbasis coefficient compatibility verified",
+
+      "Crossbasis vcov compatibility verified",
+
+      "Safe crosspred successful",
+
+      "Cumulative RR comparison generated",
+
+      "3D Lag 7 surface generated",
+
+      "3D Lag 14 surface generated",
+
+      "3D Lag 21 surface generated",
+
+      "Primary lag manually locked"
+
+    ),
+
+  Status =
+    c(
+
+      TRUE,
+
+      length(missing_variables) == 0,
+
+      all(
+        model_data$outcome %in%
+          c(0, 1)
+      ),
+
+      all(
+        stratum_qc$n_cases == 1
+      ),
+
+      all(
+        stratum_qc$n_referents >= 1
+      ),
+
+      all(
+        !is.na(
+          model_data$utci_lag0
+        )
+      ),
+
+      all(
+        !is.na(
+          model_data$utci_lag7
+        )
+      ),
+
+      all(
+        !is.na(
+          model_data$utci_lag14
+        )
+      ),
+
+      all(
+        !is.na(
+          model_data$utci_lag21
+        )
+      ),
+
+      !is.null(
+        fit_lag7_e3_l3
+      ),
+
+      !is.null(
+        fit_lag14_e3_l3
+      ),
+
+      !is.null(
+        fit_lag21_e3_l3
+      ),
+
+      all(
+        candidate_diagnostics$coefficients_match
+      ),
+
+      all(
+        candidate_diagnostics$vcov_match
+      ),
+
+      all(
+        prediction_validation$crosspred_success
+      ),
+
+      file.exists(
+        "Results/LagComparison/Figure_Cumulative_RR_Lag7_Lag14_Lag21_E3_L3.png"
+      ),
+
+      file.exists(
+        "Results/LagComparison/Figure_3D_Lag7_E3_L3.png"
+      ),
+
+      file.exists(
+        "Results/LagComparison/Figure_3D_Lag14_E3_L3.png"
+      ),
+
+      file.exists(
+        "Results/LagComparison/Figure_3D_Lag21_E3_L3.png"
+      ),
+
+      !is.null(
+        PRIMARY_LAG
+      )
+
+    )
+
+)
+
+flextable(
+  validation
+) %>%
+  autofit()
+
+write_csv(
+  validation,
+  "Results/Diagnostics/Final_Validation_Checklist.csv"
+)
+
+if (
+  !all(
+    validation$Status[
+      -nrow(validation)
+    ]
+  )
+) {
+
+  warning(
+    "One or more non-primary validation checks failed. ",
+    "Inspect Final_Validation_Checklist.csv."
+  )
+
+}
+```
+
+
+66. Final analysis status
+```{r}
+
+cat("\n")
+cat("============================================================\n")
+cat("WEST AFRICA UTCI–MORTALITY ANALYSIS STATUS\n")
+cat("============================================================\n")
+
+cat(
+  "Analytical rows: ",
+  nrow(model_data),
+  "\n"
+)
+
+cat(
+  "Case-crossover strata: ",
+  n_distinct(
+    model_data$stratum_id
+  ),
+  "\n"
+)
+
+cat(
+  "Deaths: ",
+  sum(
+    model_data$outcome == 1
+  ),
+  "\n"
+)
+
+cat(
+  "Candidate models: Lag 7 / Lag 14 / Lag 21 E3_L3\n"
+)
+
+cat(
+  "Safe crosspred validation: PASSED\n"
+)
+
+if (is.null(PRIMARY_LAG)) {
+
+  cat(
+    "\nPRIMARY LAG: NOT YET LOCKED\n"
+  )
+
+  cat(
+    "Review the LagComparison outputs before selecting the primary lag.\n"
+  )
+
+} else {
+
+  cat(
+    "\nPRIMARY LAG: Lag ",
+    PRIMARY_LAG,
+    " E3_L3\n",
+    sep = ""
+  )
+
+  cat(
+    "Primary model object saved.\n"
+  )
+
+}
+
+cat(
+  "============================================================\n"
+)
+
+```
+
+67. End-of-analysis assumptions and clarification log
+
+```{r}
+assumptions_and_clarifications <- tibble(
+
+  Item =
+    c(
+
+      "Case-crossover design",
+
+      "Referent definition",
+
+      "Exposure",
+
+      "Lag candidates",
+
+      "Spline specification",
+
+      "Primary lag",
+
+      "MMT centering",
+
+      "MMT uncertainty",
+
+      "Bootstrap/refitting",
+
+      "Temporal periods",
+
+      "Subgroup analyses"
+
+    ),
+
+  Status =
+    c(
+
+      "Taken from already processed analytical dataset",
+
+      "Taken from supplied case-crossover construction",
+
+      "UTCI mean",
+
+      "7, 14 and 21 days",
+
+      "Natural spline E3_L3",
+
+      "Requires manual investigator lock",
+
+      "Empirical median unless protocol specifies otherwise",
+
+      "Parametric coefficient Monte Carlo",
+
+      "Repeated data-resample/refit deliberately avoided",
+
+      "Determined from observed study years",
+
+      "Limited to variables actually available in analysis dataset"
+
+    )
+
+)
+
+flextable(
+  assumptions_and_clarifications
+) %>%
+  autofit()
+
+write_csv(
+  assumptions_and_clarifications,
+  "Results/Diagnostics/Assumptions_and_Clarifications.csv"
+)
+
+
+```
+
